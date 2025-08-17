@@ -1,1 +1,5 @@
 python-telegram-bot==21.4
+vosk==0.3.45
+deep-translator==1.11.4
+langdetect==1.0.9
+gTTS==2.5.1
