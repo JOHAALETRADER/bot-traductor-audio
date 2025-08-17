@@ -272,7 +272,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     await update.message.reply_text("\n".join(reply_lines))
 
-    # Generar y enviar audio
+    # Generar y enviar audio (FORZAR DOCUMENTO — sin autoplay)
     if translated:
         out_mp3 = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3").name
         if tts_to_mp3(translated, dst, out_mp3):
@@ -280,7 +280,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.UPLOAD_AUDIO)
             except Exception:
                 pass
-            send_as_document = os.getenv("SEND_AS_DOCUMENT", "").strip().lower() in ("1", "true", "yes")
+            send_as_document = True  # FORZAR DOCUMENTO
             performer = (update.effective_user.first_name or "Johanna").strip()
             title = f"Traducción ({'EN' if dst == 'en' else 'ES'})"
             with open(out_mp3, "rb") as f:
@@ -358,7 +358,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply_lines.append(translated if translated else "(no disponible)")
     await update.message.reply_text("\n".join(reply_lines))
 
-    # 7) Audio de la traducción (con metadata y opción documento)
+    # 7) Audio de la traducción (FORZAR DOCUMENTO — sin autoplay)
     if translated:
         out_mp3 = tf_in.name + ".mp3"
         if tts_to_mp3(translated, dst, out_mp3):
@@ -367,7 +367,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 pass
 
-            send_as_document = os.getenv("SEND_AS_DOCUMENT", "").strip().lower() in ("1", "true", "yes")
+            send_as_document = True  # FORZAR DOCUMENTO
             performer = (update.effective_user.first_name or "Johanna").strip()
             title = f"Traducción ({'EN' if dst == 'en' else 'ES'})"
 
