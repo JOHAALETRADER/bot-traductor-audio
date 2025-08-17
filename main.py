@@ -85,7 +85,6 @@ def pick_lang_by_score(text_es: str, text_en: str):
         return "", "unknown"
 
     if abs(score_es - score_en) <= 2:
-        # desempate: favorece ES si hay señales
         if h_es >= 1 and n_es >= 2:
             return text_es, "es"
         if h_en >= 1 and n_en >= 2:
@@ -145,7 +144,6 @@ def vosk_transcribe_both(wav_path: str):
     # Selección por puntuación robusta
     best, hint = pick_lang_by_score(text_es, text_en)
     if not best:
-        # último intento si uno de los dos existe
         if text_es:
             return text_es, "es", text_es, text_en
         if text_en:
