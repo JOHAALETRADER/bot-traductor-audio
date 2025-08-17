@@ -51,18 +51,50 @@ def ffmpeg_to_wav_mono16k(input_path: str, out_path: str) -> bool:
     return res.returncode == 0
 
 # ---------- heurística de idioma basada en stopwords ----------
-ES_STOPS = {" el ", " la ", " de ", " que ", " y ", " para ", " con ", " por ", " los ", " las ", " una ", " un "}
-EN_STOPS = {" the ", " and ", " you ", " is ", " are ", " this ", " that ", " for ", " with ", " to "}
+ES_STOPS = {" el ", " la ", " de ", " que ", " y ", " para ", " con ", " por ", " los ", " las ", " una ", " un ", " en ", " como "}
+EN_STOPS = {" the ", " and ", " you ", " is ", " are ", " this ", " that ", " for ", " with ", " to ", " in ", " of "}
+
+def stop_hits(text: str, stops: set) -> int:
+    s = f" {text.lower()} "
+    return sum(1 for w in stops if w in s)
 
 def guess_lang_by_stops(text: str) -> str:
-    s = f" {text.lower()} "
-    es_hits = sum(1 for w in ES_STOPS if w in s)
-    en_hits = sum(1 for w in EN_STOPS if w in s)
+    es_hits = stop_hits(text, ES_STOPS)
+    en_hits = stop_hits(text, EN_STOPS)
     if es_hits >= 2 and es_hits > en_hits:
         return "es"
     if en_hits >= 2 and en_hits > es_hits:
         return "en"
     return "unknown"
+
+def pick_lang_by_score(text_es: str, text_en: str):
+    """
+    Puntuación robusta:
+      score = num_palabras + 2 * num_stopwords_propias
+    Preferencia: si scores cercanos (<=2) y ES tiene >=1 stopword, favorecer ES.
+    """
+    n_es = len(text_es.split())
+    n_en = len(text_en.split())
+    h_es = stop_hits(text_es, ES_STOPS)
+    h_en = stop_hits(text_en, EN_STOPS)
+
+    score_es = n_es + 2*h_es
+    score_en = n_en + 2*h_en
+
+    if score_es == 0 and score_en == 0:
+        return "", "unknown"
+
+    if abs(score_es - score_en) <= 2:
+        # desempate: favorece ES si hay señales
+        if h_es >= 1 and n_es >= 2:
+            return text_es, "es"
+        if h_en >= 1 and n_en >= 2:
+            return text_en, "en"
+
+    if score_es > score_en:
+        return (text_es, "es" if n_es >= 2 else "unknown")
+    else:
+        return (text_en, "en" if n_en >= 2 else "unknown")
 
 # === Transcripción Vosk: devuelve (text_best, src_hint, text_es, text_en) ===
 def vosk_transcribe_both(wav_path: str):
@@ -110,35 +142,16 @@ def vosk_transcribe_both(wav_path: str):
     except Exception:
         text_en = ""
 
-    n_es = len(text_es.split())
-    n_en = len(text_en.split())
-
-    if n_es == 0 and n_en == 0:
-        return "", "unknown", text_es, text_en
-
-    # inclinamos a ES si está cerca (80%) y contiene stops de ES
-    if n_es >= 3 and (n_es >= int(max(1, n_en * 0.8))):
-        hint_by_stops = guess_lang_by_stops(text_es)
-        if hint_by_stops == "es":
+    # Selección por puntuación robusta
+    best, hint = pick_lang_by_score(text_es, text_en)
+    if not best:
+        # último intento si uno de los dos existe
+        if text_es:
             return text_es, "es", text_es, text_en
-
-    # Caso general: más largo gana
-    if n_es > n_en:
-        return text_es, "es" if n_es >= 3 else "unknown", text_es, text_en
-    elif n_en > n_es:
-        return text_en, "en" if n_en >= 3 else "unknown", text_es, text_en
-    else:
-        # misma longitud > 0 → usa stops
-        lang = guess_lang_by_stops(text_es or text_en)
-        if lang != "unknown":
-            return (text_es or text_en), lang, text_es, text_en
-        # última carta: langdetect
-        try:
-            from langdetect import detect
-            lang = normalize_lang(detect(text_es or text_en))
-        except Exception:
-            lang = "unknown"
-        return (text_es or text_en), lang, text_es, text_en
+        if text_en:
+            return text_en, "en", text_es, text_en
+        return "", "unknown", text_es, text_en
+    return best, hint, text_es, text_en
 
 def detect_lang(text: str) -> str:
     if not text:
@@ -315,19 +328,21 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("No pude transcribir el audio.")
         return
 
-    # 4) ES ↔ EN garantizado
+    # 4) ES ↔ EN garantizado (con sesgo a ES si hay duda)
     src = normalize_lang(src_hint)
     if src == "unknown":
-        src = detect_lang(text_best)
+        # refuerzo: si stops en ES detectan idioma, fuerza ES
+        sguess = guess_lang_by_stops(text_best)
+        src = sguess if sguess != "unknown" else detect_lang(text_best)
 
     if src == "es":
         dst = "en"
     elif src == "en":
         dst = "es"
     else:
-        dst = "es"
+        dst = "es"  # preferimos salida en ES si seguimos dudando
 
-    # 5) Traducir
+    # 5) Traducir (forzando source cuando se sabe)
     translated = translate(text_best, target=dst, source_lang=src if src in ("es", "en") else None)
 
     # 6) Responder texto
