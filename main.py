@@ -16,6 +16,17 @@ def getenv_stripped(name: str, default: str = "") -> str:
     val = os.getenv(name, default)
     return val.strip() if isinstance(val, str) else val
 
+def normalize_lang(code: str) -> str:
+    """Normaliza el código de idioma a 'es', 'en' o 'unknown'."""
+    if not code:
+        return "unknown"
+    s = code.lower().strip()
+    if s.startswith("es"):
+        return "es"
+    if s.startswith("en"):
+        return "en"
+    return "unknown"
+
 # ========= Modelos Vosk (ES y EN) =========
 MODELS_DIR = Path("/app/models")
 ES_MODEL_DIR = MODELS_DIR / "vosk-model-small-es-0.42"
@@ -89,8 +100,9 @@ def detect_lang(text: str) -> str:
         from langdetect import detect
         return detect(text)
     except Exception:
-        s = text.lower()
-        if any(w in s for w in [" el ", " la ", " de ", " que ", " y ", " para ", " con "]):
+        s = " " + text.lower() + " "
+        # heurística simple para español
+        if any(w in s for w in [" el ", " la ", " de ", " que ", " y ", " para ", " con ", " por ", " los ", " las "]):
             return "es"
         return "en"
 
@@ -156,19 +168,35 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("No pude transcribir el audio.")
         return
 
-    # 4) Detectar idioma y traducir
-    src = detect_lang(text)  # 'es' o 'en'
-    dst = "en" if src.startswith("es") else "es"
+    # 4) Detectar idioma y FORZAR mapeo ES ↔ EN
+    src_raw = detect_lang(text)            # p.ej. 'es', 'en', 'unknown'
+    src = normalize_lang(src_raw)          # 'es' | 'en' | 'unknown'
+
+    # ---- BLOQUE FORZADO ES ↔ EN ----
+    if src == "es":
+        dst = "en"
+    elif src == "en":
+        dst = "es"
+    else:
+        # Si no estamos seguros, forzamos a traducir SIEMPRE al español
+        # (puedes cambiar a 'en' si prefieres)
+        dst = "es"
+        src = "unknown"
+    # --------------------------------
+
     translated = translate(text, dst)
 
     # 5) Responder texto
+    human_src = "Español" if src == "es" else "Inglés" if src == "en" else src
+    human_dst = "Inglés" if dst == "en" else "Español"
+
     reply_lines = []
-    reply_lines.append("Idioma detectado: {}".format("Español" if src.startswith("es") else "Inglés" if src.startswith("en") else src))
+    reply_lines.append("Idioma detectado: {}".format(human_src))
     reply_lines.append("")
     reply_lines.append("Transcripción:")
     reply_lines.append(text)
     reply_lines.append("")
-    reply_lines.append("Traducción ({}):".format("Inglés" if dst == "en" else "Español"))
+    reply_lines.append("Traducción ({}):".format(human_dst))
     reply_lines.append(translated if translated else "(no disponible)")
     await update.message.reply_text("\n".join(reply_lines))
 
@@ -181,9 +209,12 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.UPLOAD_AUDIO)
             except Exception:
                 pass
-            # Como audio (no voice) para que Telegram permita guardar fácilmente
             with open(out_mp3, "rb") as f:
-                await update.message.reply_audio(audio=f, title="Traducción", caption="Audio generado ({})".format("en" if dst == "en" else "es"))
+                await update.message.reply_audio(
+                    audio=f,
+                    title="Traducción",
+                    caption="Audio generado ({})".format("en" if dst == "en" else "es")
+                )
         else:
             await update.message.reply_text("No pude generar el audio de la traducción (TTS).")
 
