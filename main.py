@@ -64,7 +64,7 @@ def guess_lang_by_stops(text: str) -> str:
         return "en"
     return "unknown"
 
-# === Transcripción Vosk: devuelve (text_es, text_en) y decide mejor ===
+# === Transcripción Vosk: devuelve (text_best, src_hint, text_es, text_en) ===
 def vosk_transcribe_both(wav_path: str):
     """
     Retorna (text_best, src_hint, text_es, text_en)
@@ -113,11 +113,10 @@ def vosk_transcribe_both(wav_path: str):
     n_es = len(text_es.split())
     n_en = len(text_en.split())
 
-    # Empate o cercanos: usa stops para inclinar a ES si corresponde
     if n_es == 0 and n_en == 0:
         return "", "unknown", text_es, text_en
 
-    # Si ambos existen, inclinamos a ES si está cerca (80%) y contiene stops de ES
+    # inclinamos a ES si está cerca (80%) y contiene stops de ES
     if n_es >= 3 and (n_es >= int(max(1, n_en * 0.8))):
         hint_by_stops = guess_lang_by_stops(text_es)
         if hint_by_stops == "es":
@@ -129,8 +128,7 @@ def vosk_transcribe_both(wav_path: str):
     elif n_en > n_es:
         return text_en, "en" if n_en >= 3 else "unknown", text_es, text_en
     else:
-        # misma longitud > 0
-        # usa stops
+        # misma longitud > 0 → usa stops
         lang = guess_lang_by_stops(text_es or text_en)
         if lang != "unknown":
             return (text_es or text_en), lang, text_es, text_en
@@ -213,15 +211,82 @@ def tts_to_mp3(text: str, lang_code: str, out_mp3_path: str, slow: bool = False)
 # ========= Handlers =========
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = (
-        "Traductor de audios:\n"
-        "1) Envía una nota de voz en español o inglés.\n"
-        "2) Respondo con transcripción, traducción y audio en el idioma destino."
+        "Traductor de audios y texto:\n"
+        "• Nota de voz ES → EN (texto + audio)\n"
+        "• Nota de voz EN → ES (texto + audio)\n"
+        "• Texto ES → audio EN\n"
+        "• Texto EN → audio ES\n"
+        "\nComandos:\n/health  (estado)"
     )
     await update.message.reply_text(msg)
 
 async def health(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("ok")
 
+# ---- Texto a audio (ES<->EN) ----
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text_in = (update.message.text or "").strip()
+    if not text_in:
+        return
+    try:
+        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
+    except Exception:
+        pass
+
+    # Detectar idioma del texto y decidir destino
+    src = detect_lang(text_in)
+    if src == "es":
+        dst = "en"
+    elif src == "en":
+        dst = "es"
+    else:
+        # si dudamos, forzamos a español como salida
+        dst = "es"
+
+    translated = translate(text_in, target=dst, source_lang=src if src in ("es", "en") else None)
+
+    # Responder texto
+    human_src = "Español" if src == "es" else "Inglés" if src == "en" else "desconocido"
+    human_dst = "Inglés" if dst == "en" else "Español"
+    reply_lines = [
+        f"Idioma detectado (texto): {human_src}",
+        "",
+        "Original:",
+        text_in,
+        "",
+        f"Traducción ({human_dst}):",
+        translated if translated else "(no disponible)"
+    ]
+    await update.message.reply_text("\n".join(reply_lines))
+
+    # Generar y enviar audio
+    if translated:
+        out_mp3 = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3").name
+        if tts_to_mp3(translated, dst, out_mp3):
+            try:
+                await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.UPLOAD_AUDIO)
+            except Exception:
+                pass
+            send_as_document = os.getenv("SEND_AS_DOCUMENT", "").strip().lower() in ("1", "true", "yes")
+            performer = (update.effective_user.first_name or "Johanna").strip()
+            title = f"Traducción ({'EN' if dst == 'en' else 'ES'})"
+            with open(out_mp3, "rb") as f:
+                if send_as_document:
+                    await update.message.reply_document(
+                        document=InputFile(f, filename=f"{title}.mp3"),
+                        caption=f"{title} — {performer}"
+                    )
+                else:
+                    await update.message.reply_audio(
+                        audio=InputFile(f, filename=f"{title}.mp3"),
+                        title=title,
+                        performer=performer,
+                        caption=title
+                    )
+        else:
+            await update.message.reply_text("No pude generar el audio de la traducción (TTS).")
+
+# ---- Voz a texto+audio (ES<->EN) ----
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     voice = update.message.voice
     if not voice:
@@ -244,13 +309,13 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("No pude convertir el audio. Revisa FFmpeg.")
         return
 
-    # 3) Transcribir con ambos modelos (y obtener pista de idioma robusta)
+    # 3) Transcribir (ambos modelos) y obtener pista de idioma robusta
     text_best, src_hint, text_es, text_en = vosk_transcribe_both(wav_path)
     if not text_best:
         await update.message.reply_text("No pude transcribir el audio.")
         return
 
-    # 4) Decidir destino: ES ↔ EN garantizado
+    # 4) ES ↔ EN garantizado
     src = normalize_lang(src_hint)
     if src == "unknown":
         src = detect_lang(text_best)
@@ -260,16 +325,14 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif src == "en":
         dst = "es"
     else:
-        # si aún dudamos, forzamos a español
         dst = "es"
 
-    # 5) Traducir (indicamos source explícito si lo sabemos)
+    # 5) Traducir
     translated = translate(text_best, target=dst, source_lang=src if src in ("es", "en") else None)
 
     # 6) Responder texto
     human_src = "Español" if src == "es" else "Inglés" if src == "en" else "desconocido"
     human_dst = "Inglés" if dst == "en" else "Español"
-
     reply_lines = []
     reply_lines.append(f"Idioma detectado: {human_src}")
     reply_lines.append("")
@@ -318,6 +381,9 @@ def build_app():
     app = Application.builder().token(bot_token).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("health", health))
+    # Texto (que no sea comando) → TTS al otro idioma
+    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_text))
+    # Notas de voz → transcribe + traduce + TTS
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
     return app
 
