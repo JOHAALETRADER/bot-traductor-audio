@@ -326,6 +326,20 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("No pude transcribir el audio.")
         return
 
+    # === NUEVO BLOQUE DE COHERENCIA ES/EN ===
+    # Si los stopwords inclinan claramente a ES/EN, fuerza idioma y texto correspondiente.
+    # Esto corrige los casos en los que Vosk elige un "best" incorrecto por longitud/ruido.
+    forced_lang = guess_lang_by_stops(text_best)
+    es_hits = stop_hits(text_es, ES_STOPS)
+    en_hits = stop_hits(text_en, EN_STOPS)
+
+    if es_hits >= max(2, en_hits + 1) and len(text_es.split()) >= 2:
+        text_best = text_es
+        src_hint = "es"
+    elif en_hits >= max(2, es_hits + 1) and len(text_en.split()) >= 2:
+        text_best = text_en
+        src_hint = "en"
+
     # 4) ES ↔ EN garantizado (con sesgo a ES si hay duda)
     src = normalize_lang(src_hint)
     if src == "unknown":
