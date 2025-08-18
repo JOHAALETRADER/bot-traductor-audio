@@ -57,8 +57,15 @@ def ffmpeg_to_wav_mono16k(input_path: str, out_path: str) -> bool:
     return res.returncode == 0
 
 # ---------- heurística de idioma basada en stopwords ----------
-ES_STOPS = {" el ", " la ", " de ", " que ", " y ", " para ", " con ", " por ", " los ", " las ", " una ", " un ", " en ", " como "}
-EN_STOPS = {" the ", " and ", " you ", " is ", " are ", " this ", " that ", " for ", " with ", " to ", " in ", " of "}
+ES_STOPS = {
+    " el "," la "," de "," que "," y "," para "," con "," por "," los "," las ",
+    " una "," un "," en "," como "," pero "," porque "," aquí "," eso "," este ",
+    " esta "," esto "," así "," entonces "," hola "," gracias "," si "," no "
+}
+EN_STOPS = {
+    " the "," and "," you "," is "," are "," this "," that "," for "," with ",
+    " to "," in "," of "," on "," at "," it "," we "," they "," but "
+}
 
 def stop_hits(text: str, stops: set) -> int:
     s = f" {text.lower()} "
@@ -112,6 +119,12 @@ def jaccard_similarity(a: str, b: str) -> float:
     inter = len(sa & sb)
     union = len(sa | sb)
     return inter / max(1, union)
+
+def strip_laughter_noises(t: str) -> str:
+    # elimina repeticiones típicas de risa y rellenos cortos
+    t = re.sub(r"\b(ja+|ha+|jaja+|jeje+|jiji+|ahaha+|eh+|uh+|mmm+)\b", " ", t, flags=re.I)
+    t = re.sub(r"\s{2,}", " ", t).strip()
+    return t
 
 # === Transcripción Vosk: devuelve (text_best, src_hint, text_es, text_en) ===
 def vosk_transcribe_both(wav_path: str):
@@ -439,17 +452,33 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("No pude transcribir el audio.")
         return
 
-    es_hits = stop_hits(text_es, ES_STOPS)
-    en_hits = stop_hits(text_en, EN_STOPS)
-    if es_hits >= max(2, en_hits + 1) and len(text_es.split()) >= 2:
-        text_best = text_es
-        src_hint = "es"
-    elif en_hits >= max(3, es_hits + 2) and len(text_en.split()) >= 2:
-        text_best = text_en
-        src_hint = "en"
-    elif is_spanishish(text_es) and len(text_es.split()) >= 2 and len(text_es.split()) >= len(text_en.split()) - 1:
-        text_best = text_es
-        src_hint = "es"
+    # === BLOQUE DE COHERENCIA ES/EN (refuerzo fuerte a ES) ===
+# Limpia onomatopeyas/risas antes de contar
+text_es = strip_laughter_noises(text_es)
+text_en = strip_laughter_noises(text_en)
+text_best = strip_laughter_noises(text_best)
+
+n_es, n_en = len(text_es.split()), len(text_en.split())
+es_hits = stop_hits(text_es, ES_STOPS)
+en_hits = stop_hits(text_en, EN_STOPS)
+
+# 1) Si hay CUALQUIER señal de español y no estamos muy por debajo en longitud, fuerza ES
+if es_hits >= 1 and n_es >= max(3, n_en - 2):
+    text_best = text_es
+    src_hint = "es"
+# 2) Si hay buenas señales de EN y ES realmente queda corto, usa EN
+elif en_hits >= 2 and n_en >= max(3, n_es + 1):
+    text_best = text_en
+    src_hint = "en"
+# 3) Si uno es 25% más largo que el otro, elige el más largo
+elif n_es >= n_en * 1.25 and n_es >= 3:
+    text_best = text_es
+    src_hint = "es"
+elif n_en >= n_es * 1.25 and n_en >= 3:
+    text_best = text_en
+    src_hint = "en"
+# (si nada de lo anterior aplica, nos quedamos con lo que ya eligió el scoring previo)
+
 
     src = normalize_lang(src_hint)
     if src == "unknown":
