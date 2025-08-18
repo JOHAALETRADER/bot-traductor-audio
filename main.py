@@ -8,8 +8,9 @@ import urllib.request
 import shutil
 import re
 from pathlib import Path
+from typing import Optional
 
-# DeepL con requests (sin aiohttp)
+# DeepL (requests, sin aiohttp)
 import asyncio
 import requests
 
@@ -23,7 +24,7 @@ def getenv_stripped(name: str, default: str = "") -> str:
     return val.strip() if isinstance(val, str) else val
 
 def normalize_lang(code: str) -> str:
-    """Normaliza el código de idioma a 'es', 'en' o 'unknown'."""
+    """Normaliza 'es' / 'en' / 'unknown'."""
     if not code:
         return "unknown"
     s = code.lower().strip()
@@ -35,7 +36,7 @@ def normalize_lang(code: str) -> str:
 
 # ========= Modelos Vosk (ES y EN) =========
 MODELS_DIR = Path("/app/models")
-# USAR MODELO GRANDE DE ESPAÑOL (mejor calidad)
+# ⚠️ Español: modelo GRANDE para mucha mejor precisión.
 ES_MODEL_DIR = MODELS_DIR / "vosk-model-es-0.42"
 EN_MODEL_DIR = MODELS_DIR / "vosk-model-small-en-us-0.15"
 
@@ -53,9 +54,14 @@ def ensure_model(model_dir: Path, url: str):
     zip_path.unlink(missing_ok=True)
 
 def ffmpeg_to_wav_mono16k(input_path: str, out_path: str) -> bool:
-    cmd = ["ffmpeg", "-y", "-i", input_path, "-ac", "1", "-ar", "16000", out_path]
-    res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    return res.returncode == 0
+    """Convierte cualquier audio a WAV mono 16k. Si no hay ffmpeg, falla con gracia."""
+    try:
+        cmd = ["ffmpeg", "-y", "-i", input_path, "-ac", "1", "-ar", "16000", out_path]
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        return res.returncode == 0
+    except FileNotFoundError:
+        # ffmpeg no está instalado
+        return False
 
 # ---------- heurística de idioma basada en stopwords ----------
 ES_STOPS = {
@@ -82,11 +88,7 @@ def guess_lang_by_stops(text: str) -> str:
     return "unknown"
 
 def pick_lang_by_score(text_es: str, text_en: str):
-    """
-    Puntuación robusta:
-      score = num_palabras + 2 * num_stopwords_propias
-    Preferencia: si scores cercanos (<=2) y ES tiene >=1 stopword, favorecer ES.
-    """
+    """score = num_palabras + 2*stopwords; desempate favorece ES."""
     n_es = len(text_es.split())
     n_en = len(text_en.split())
     h_es = stop_hits(text_es, ES_STOPS)
@@ -105,9 +107,8 @@ def pick_lang_by_score(text_es: str, text_en: str):
     else:
         return (text_en, "en" if n_en >= 2 else "unknown")
 
-# === Utilidades extra para robustez ES→EN ===
+# === Utilidades de robustez ===
 def is_spanishish(text: str) -> bool:
-    """Señales rápidas de español: tildes o muchas stopwords ES."""
     if any(c in text for c in "áéíóúñ¿¡"):
         return True
     return stop_hits(text, ES_STOPS) >= 2
@@ -122,18 +123,20 @@ def jaccard_similarity(a: str, b: str) -> float:
     return inter / max(1, union)
 
 def strip_laughter_noises(t: str) -> str:
-    # elimina repeticiones típicas de risa, rellenos cortos y rarezas
+    # elimina risas/onomatopeyas y duplicados de espacios
     t = re.sub(r"\b(ja+|ha+|jaja+|jeje+|jiji+|ahaha+|eh+|uh+|mmm+)\b", " ", t, flags=re.I)
-    t = re.sub(r"[^\wáéíóúñÁÉÍÓÚÑ\s,.!?;:()-]", " ", t)
-    t = re.sub(r"\b\w{1}\b", " ", t)  # descarta tokens de 1 letra sueltos
+    t = re.sub(r"[^\wáéíóúñüÁÉÍÓÚÑÜ¿¡\s\.,;:\?!\-']", " ", t)  # limpia símbolos raros
     t = re.sub(r"\s{2,}", " ", t).strip()
     return t
 
-# === Transcripción Vosk: devuelve (text_best, src_hint, text_es, text_en) ===
+# ========= Reconocimiento Vosk =========
+FORCE_STT_LANG = getenv_stripped("FORCE_STT_LANG", "es").lower()  # 'es' | 'en' | 'auto'
+
 def vosk_transcribe_both(wav_path: str):
     """
     Retorna (text_best, src_hint, text_es, text_en)
-    - src_hint: 'es' | 'en' | 'unknown'
+    src_hint: 'es' | 'en' | 'unknown'
+    Respeta FORCE_STT_LANG (por defecto 'es').
     """
     try:
         import vosk
@@ -143,7 +146,7 @@ def vosk_transcribe_both(wav_path: str):
     text_es = ""
     text_en = ""
 
-    # ES
+    # Siempre cargamos ES (principal)
     try:
         ensure_model(ES_MODEL_DIR, ES_URL)
         model_es = __import__("vosk").Model(str(ES_MODEL_DIR))
@@ -155,27 +158,35 @@ def vosk_transcribe_both(wav_path: str):
                     break
                 rec_es.AcceptWaveform(data)
         res = json.loads(rec_es.FinalResult() or "{}")
-        text_es = (res.get("text") or "").strip()
+        text_es = strip_laughter_noises((res.get("text") or "").strip())
     except Exception:
         text_es = ""
 
-    # EN
-    try:
-        ensure_model(EN_MODEL_DIR, EN_URL)
-        model_en = __import__("vosk").Model(str(EN_MODEL_DIR))
-        rec_en = __import__("vosk").KaldiRecognizer(model_en, 16000)
-        with open(wav_path, "rb") as f:
-            while True:
-                data = f.read(4000)
-                if not data:
-                    break
-                rec_en.AcceptWaveform(data)
-        res = json.loads(rec_en.FinalResult() or "{}")
-        text_en = (res.get("text") or "").strip()
-    except Exception:
-        text_en = ""
+    # Dependiendo del modo, ejecutamos EN también
+    run_en = (FORCE_STT_LANG == "auto") or (FORCE_STT_LANG == "en")
+    if run_en:
+        try:
+            ensure_model(EN_MODEL_DIR, EN_URL)
+            model_en = __import__("vosk").Model(str(EN_MODEL_DIR))
+            rec_en = __import__("vosk").KaldiRecognizer(model_en, 16000)
+            with open(wav_path, "rb") as f:
+                while True:
+                    data = f.read(4000)
+                    if not data:
+                        break
+                    rec_en.AcceptWaveform(data)
+            res = json.loads(rec_en.FinalResult() or "{}")
+            text_en = strip_laughter_noises((res.get("text") or "").strip())
+        except Exception:
+            text_en = ""
 
-    # Selección por puntuación robusta
+    # Si está forzado a ES/EN, elige directo
+    if FORCE_STT_LANG == "es":
+        return (text_es, "es" if text_es else "unknown", text_es, text_en)
+    if FORCE_STT_LANG == "en":
+        return (text_en, "en" if text_en else "unknown", text_es, text_en)
+
+    # AUTO: elegir por puntuación y refuerzo
     best, hint = pick_lang_by_score(text_es, text_en)
     if not best:
         if text_es:
@@ -183,6 +194,19 @@ def vosk_transcribe_both(wav_path: str):
         if text_en:
             return text_en, "en", text_es, text_en
         return "", "unknown", text_es, text_en
+
+    # Refuerzo fuerte a ES si hay señales
+    n_es, n_en = len(text_es.split()), len(text_en.split())
+    es_hits = stop_hits(text_es, ES_STOPS)
+    en_hits = stop_hits(text_en, EN_STOPS)
+    if es_hits >= 1 and n_es >= max(3, n_en - 2):
+        return text_es, "es", text_es, text_en
+    if en_hits >= 2 and n_en >= max(3, n_es + 1):
+        return text_en, "en", text_es, text_en
+    if n_es >= n_en * 1.25 and n_es >= 3:
+        return text_es, "es", text_es, text_en
+    if n_en >= n_es * 1.25 and n_en >= 3:
+        return text_en, "en", text_es, text_en
     return best, hint, text_es, text_en
 
 def detect_lang(text: str) -> str:
@@ -194,13 +218,12 @@ def detect_lang(text: str) -> str:
     except Exception:
         return guess_lang_by_stops(text)
 
-# ========= Traducción (DeepL -> Google) + Glosario Local =========
+# ========= Traducción (DeepL -> Google) + Glosario =========
 DEEPL_API_KEY = getenv_stripped("DEEPL_API_KEY", "")
 DEEPL_API_HOST = getenv_stripped("DEEPL_API_HOST", "api-free.deepl.com")
 USE_LOCAL_GLOSSARY = getenv_stripped("USE_LOCAL_GLOSSARY", "true").lower() in ("1","true","yes")
 
-def translate_deepl(text: str, target: str, source_lang: str | None) -> str:
-    """Traduce con DeepL si hay API; si falla, devuelve ''. (requests, sin aiohttp)"""
+def translate_deepl(text: str, target: str, source_lang: Optional[str]) -> str:
     if not DEEPL_API_KEY:
         return ""
     tgt = "EN" if str(target).lower().startswith("en") else "ES"
@@ -209,12 +232,10 @@ def translate_deepl(text: str, target: str, source_lang: str | None) -> str:
         src = "EN"
     elif (source_lang or "").lower().startswith("es"):
         src = "ES"
-
     url = f"https://{DEEPL_API_HOST}/v2/translate"
     data = {"auth_key": DEEPL_API_KEY, "text": text, "target_lang": tgt}
     if src:
         data["source_lang"] = src
-
     try:
         def _post():
             return requests.post(url, data=data, timeout=30)
@@ -229,7 +250,7 @@ def translate_deepl(text: str, target: str, source_lang: str | None) -> str:
     except Exception:
         return ""
 
-def translate_google(text: str, target: str, source_lang: str | None) -> str:
+def translate_google(text: str, target: str, source_lang: Optional[str]) -> str:
     try:
         from deep_translator import GoogleTranslator
         src = source_lang if source_lang in ("es","en") else "auto"
@@ -237,7 +258,7 @@ def translate_google(text: str, target: str, source_lang: str | None) -> str:
     except Exception:
         return ""
 
-# --- Glosario local (post-proceso) ---
+# Glosario local
 ES_EN_RULES = [
     (r"\bdep[oó]sito[s]?\s+m[ií]nimo[s]?\b", "minimum deposit"),
     (r"\bse[ñn]al(es)?\b", "signal"),
@@ -254,7 +275,6 @@ EN_ES_RULES = [
 ]
 
 def apply_local_glossary(text: str, direction: tuple[str,str]) -> str:
-    """direction = ('es','en') o ('en','es')"""
     if not USE_LOCAL_GLOSSARY or not text:
         return text
     src, dst = direction
@@ -264,23 +284,18 @@ def apply_local_glossary(text: str, direction: tuple[str,str]) -> str:
         out = re.sub(pattern, repl, out, flags=re.IGNORECASE)
     return out
 
-def translate_smart(text: str, target: str, source_lang: str | None) -> str:
-    """Intenta DeepL y cae a Google, luego aplica glosario local."""
-    # Refuerzo de idioma de origen si no viene claro
-    if not source_lang or source_lang not in ("es","en"):
-        guess = detect_lang(text)
-        if guess in ("es","en"):
-            source_lang = guess
+def translate_smart(text: str, target: str, source_lang: Optional[str]) -> str:
+    t = translate_deepl(text, target, source_lang)
+    if not t:
+        t = translate_google(text, target, source_lang)
+    src_norm = (source_lang or "unknown")
+    if src_norm not in ("es","en"):
+        src_norm = detect_lang(text)
+    if src_norm not in ("es","en"):
+        src_norm = "es" if target.startswith("en") else "en"
+    return apply_local_glossary(t, (src_norm, "en" if target.startswith("en") else "es"))
 
-    translated = translate_deepl(text, target, source_lang)
-    if not translated:
-        translated = translate_google(text, target, source_lang)
-
-    src_norm = source_lang or ("es" if target.startswith("en") else "en")
-    fixed = apply_local_glossary(translated, (src_norm, "en" if target.startswith("en") else "es"))
-    return fixed
-
-# ========= TTS (ElevenLabs -> fallback gTTS) =========
+# ========= TTS (ElevenLabs -> gTTS) =========
 def synthesize_tts(text: str, lang_code: str, out_mp3_path: str, slow: bool = False) -> bool:
     eleven_api_key = os.getenv("ELEVEN_API_KEY", "").strip()
     eleven_voice_id = os.getenv("ELEVEN_VOICE_ID", "").strip()
@@ -309,18 +324,18 @@ def synthesize_tts(text: str, lang_code: str, out_mp3_path: str, slow: bool = Fa
                     f.write(r.content)
                 return True
         except Exception:
-            pass  # fallback a gTTS
+            pass  # cae a gTTS
 
     try:
         from gtts import gTTS
         tld = "com.mx" if lang_code.startswith("es") else "com"
-        tts = gTTS(text=text, lang=("es" if lang_code.startswith("es") else "en"), tld=tld, slow=slow)
-        tts.save(out_mp3_path)
+        gTTS(text=text, lang=("es" if lang_code.startswith("es") else "en"), tld=tld, slow=slow).save(out_mp3_path)
         return True
     except Exception:
         return False
 
 def adjust_speed_with_ffmpeg(in_mp3: str, out_mp3: str, speed: float) -> bool:
+    """Ajusta velocidad manteniendo tono con atempo; si no hay ffmpeg, copia tal cual."""
     try:
         spd = max(0.5, min(2.0, float(speed)))
     except Exception:
@@ -331,10 +346,14 @@ def adjust_speed_with_ffmpeg(in_mp3: str, out_mp3: str, speed: float) -> bool:
             return True
         except Exception:
             return False
-    cmd = ["ffmpeg", "-y", "-i", in_mp3, "-filter:a", f"atempo={spd}", "-vn", out_mp3]
-    res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    if res.returncode == 0 and os.path.exists(out_mp3) and os.path.getsize(out_mp3) > 0:
-        return True
+    try:
+        cmd = ["ffmpeg", "-y", "-i", in_mp3, "-filter:a", f"atempo={spd}", "-vn", out_mp3]
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if res.returncode == 0 and os.path.exists(out_mp3) and os.path.getsize(out_mp3) > 0:
+            return True
+    except FileNotFoundError:
+        pass
+    # Sin ffmpeg o fallo: copia
     try:
         shutil.copyfile(in_mp3, out_mp3)
         return True
@@ -342,21 +361,20 @@ def adjust_speed_with_ffmpeg(in_mp3: str, out_mp3: str, speed: float) -> bool:
         return False
 
 def tts_to_mp3(text: str, lang_code: str, out_mp3_path: str, slow: bool = False) -> bool:
-    raw_mp3 = out_mp3_path + ".raw.mp3"
-    ok = synthesize_tts(text, lang_code, raw_mp3, slow=slow)
-    if not ok:
+    raw = out_mp3_path + ".raw.mp3"
+    if not synthesize_tts(text, lang_code, raw, slow=slow):
         return False
-    speed = getenv_stripped("TTS_SPEED", "1.0")
+    speed = getenv_stripped("TTS_SPEED", "0.95")  # un pelín más lento por default
     try:
         spd = float(speed)
     except Exception:
         spd = 1.0
-    ok2 = adjust_speed_with_ffmpeg(raw_mp3, out_mp3_path, spd)
+    ok = adjust_speed_with_ffmpeg(raw, out_mp3_path, spd)
     try:
-        os.remove(raw_mp3)
+        os.remove(raw)
     except Exception:
         pass
-    return ok2
+    return ok
 
 # ========= Handlers =========
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -366,7 +384,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• Nota de voz EN → ES (texto + audio)\n"
         "• Texto ES → audio EN\n"
         "• Texto EN → audio ES\n"
-        "\nComandos:\n/health  (estado)"
+        "\nComandos:\n/health (estado)"
     )
     await update.message.reply_text(msg)
 
@@ -384,18 +402,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pass
 
     src = detect_lang(text_in)
-    if src == "es":
-        dst = "en"
-    elif src == "en":
-        dst = "es"
-    else:
-        dst = "es"
-
+    dst = "en" if src == "es" else ("es" if src == "en" else "es")
     translated = translate_smart(text_in, target=dst, source_lang=src if src in ("es","en") else None)
 
     human_src = "Español" if src == "es" else "Inglés" if src == "en" else "desconocido"
     human_dst = "Inglés" if dst == "en" else "Español"
-    reply_lines = [
+    reply = [
         f"Idioma detectado (texto): {human_src}",
         "",
         "Original:",
@@ -404,7 +416,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Traducción ({human_dst}):",
         translated if translated else "(no disponible)"
     ]
-    await update.message.reply_text("\n".join(reply_lines))
+    await update.message.reply_text("\n".join(reply))
 
     if translated:
         out_mp3 = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3").name
@@ -438,7 +450,7 @@ async def _process_audio_file(update: Update, context: ContextTypes.DEFAULT_TYPE
     wav_path = tf_in.name + ".wav"
     ok = ffmpeg_to_wav_mono16k(tf_in.name, wav_path)
     if not ok:
-        await update.message.reply_text("No pude convertir el audio. Revisa FFmpeg.")
+        await update.message.reply_text("No pude convertir el audio. Revisa FFmpeg (agrega apt.txt con 'ffmpeg').")
         return
 
     # 3) Transcribir
@@ -447,30 +459,7 @@ async def _process_audio_file(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text("No pude transcribir el audio.")
         return
 
-    # 3.1 Limpieza/normalización previa
-    text_es  = strip_laughter_noises(text_es)
-    text_en  = strip_laughter_noises(text_en)
-    text_best = strip_laughter_noises(text_best)
-
-    # 3.2 Refuerzo ES/EN
-    n_es, n_en = len(text_es.split()), len(text_en.split())
-    es_hits = stop_hits(text_es, ES_STOPS)
-    en_hits = stop_hits(text_en, EN_STOPS)
-
-    if es_hits >= 1 and n_es >= max(3, n_en - 2):
-        text_best = text_es
-        src_hint = "es"
-    elif en_hits >= 2 and n_en >= max(3, n_es + 1):
-        text_best = text_en
-        src_hint = "en"
-    elif n_es >= n_en * 1.25 and n_es >= 3:
-        text_best = text_es
-        src_hint = "es"
-    elif n_en >= n_es * 1.25 and n_en >= 3:
-        text_best = text_en
-        src_hint = "en"
-
-    # 4) ES ↔ EN
+    # 4) Decidir direcciones
     src = normalize_lang(src_hint)
     if src == "unknown":
         sguess = guess_lang_by_stops(text_best)
@@ -480,18 +469,17 @@ async def _process_audio_file(update: Update, context: ContextTypes.DEFAULT_TYPE
     # 5) Traducir
     translated = translate_smart(text_best, target=dst, source_lang=src if src in ("es","en") else None)
 
-    # Fallback si detectó mal
+    # fallback si detectó mal
     if src == "en":
         sim = jaccard_similarity(text_best, translated)
         if is_spanishish(text_best) or sim >= 0.75:
-            src = "es"
-            dst = "en"
+            src, dst = "es", "en"
             translated = translate_smart(text_best, target=dst, source_lang="es")
 
     # 6) Respuesta textual
     human_src = "Español" if src == "es" else "Inglés" if src == "en" else "desconocido"
     human_dst = "Inglés" if dst == "en" else "Español"
-    reply_lines = [
+    reply = [
         f"Idioma detectado: {human_src}",
         "",
         "Transcripción:",
@@ -500,9 +488,9 @@ async def _process_audio_file(update: Update, context: ContextTypes.DEFAULT_TYPE
         f"Traducción ({human_dst}):",
         translated if translated else "(no disponible)"
     ]
-    await update.message.reply_text("\n".join(reply_lines))
+    await update.message.reply_text("\n".join(reply))
 
-    # 7) Audio de la traducción (documento — sin autoplay)
+    # 7) Audio de la traducción (como documento, sin autoplay)
     if translated:
         out_mp3 = tf_in.name + ".mp3"
         if tts_to_mp3(translated, dst, out_mp3):
@@ -559,7 +547,8 @@ def build_app():
     app = Application.builder().token(bot_token).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("health", health))
-    # Texto (que no sea comando)
+
+    # Texto (no comando)
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_text))
     # Notas de voz
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
