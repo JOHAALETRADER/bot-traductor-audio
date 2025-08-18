@@ -214,11 +214,11 @@ def translate_deepl(text: str, target: str, source_lang: str | None) -> str:
         data["source_lang"] = src
 
     try:
-        # Para no bloquear demasiado, usamos to_thread (opcional); si falla, hacemos post directo.
         def _post():
             return requests.post(url, data=data, timeout=30)
         try:
-            resp = asyncio.get_event_loop().run_until_complete(asyncio.to_thread(_post))  # si no hay loop activo, caerá al except
+            # si hay loop activo, esto fallará y caemos a la llamada directa (bien)
+            resp = asyncio.get_event_loop().run_until_complete(asyncio.to_thread(_post))
         except Exception:
             resp = requests.post(url, data=data, timeout=30)
 
@@ -437,49 +437,52 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
 
+    # 1) Descargar OGG
     tf_in = tempfile.NamedTemporaryFile(delete=False, suffix=".ogg")
     tg_file = await voice.get_file()
     await tg_file.download_to_drive(custom_path=tf_in.name)
 
+    # 2) Convertir a WAV 16k mono
     wav_path = tf_in.name + ".wav"
     ok = ffmpeg_to_wav_mono16k(tf_in.name, wav_path)
     if not ok:
         await update.message.reply_text("No pude convertir el audio. Revisa FFmpeg.")
         return
 
+    # 3) Transcribir (ambos modelos)
     text_best, src_hint, text_es, text_en = vosk_transcribe_both(wav_path)
     if not text_best:
         await update.message.reply_text("No pude transcribir el audio.")
         return
 
     # === BLOQUE DE COHERENCIA ES/EN (refuerzo fuerte a ES) ===
-# Limpia onomatopeyas/risas antes de contar
-text_es = strip_laughter_noises(text_es)
-text_en = strip_laughter_noises(text_en)
-text_best = strip_laughter_noises(text_best)
+    # Limpia onomatopeyas/risas antes de contar
+    text_es = strip_laughter_noises(text_es)
+    text_en = strip_laughter_noises(text_en)
+    text_best = strip_laughter_noises(text_best)
 
-n_es, n_en = len(text_es.split()), len(text_en.split())
-es_hits = stop_hits(text_es, ES_STOPS)
-en_hits = stop_hits(text_en, EN_STOPS)
+    n_es, n_en = len(text_es.split()), len(text_en.split())
+    es_hits = stop_hits(text_es, ES_STOPS)
+    en_hits = stop_hits(text_en, EN_STOPS)
 
-# 1) Si hay CUALQUIER señal de español y no estamos muy por debajo en longitud, fuerza ES
-if es_hits >= 1 and n_es >= max(3, n_en - 2):
-    text_best = text_es
-    src_hint = "es"
-# 2) Si hay buenas señales de EN y ES realmente queda corto, usa EN
-elif en_hits >= 2 and n_en >= max(3, n_es + 1):
-    text_best = text_en
-    src_hint = "en"
-# 3) Si uno es 25% más largo que el otro, elige el más largo
-elif n_es >= n_en * 1.25 and n_es >= 3:
-    text_best = text_es
-    src_hint = "es"
-elif n_en >= n_es * 1.25 and n_en >= 3:
-    text_best = text_en
-    src_hint = "en"
-# (si nada de lo anterior aplica, nos quedamos con lo que ya eligió el scoring previo)
+    # 1) Si hay CUALQUIER señal de español y no estamos muy por debajo en longitud, fuerza ES
+    if es_hits >= 1 and n_es >= max(3, n_en - 2):
+        text_best = text_es
+        src_hint = "es"
+    # 2) Si hay buenas señales de EN y ES realmente queda corto, usa EN
+    elif en_hits >= 2 and n_en >= max(3, n_es + 1):
+        text_best = text_en
+        src_hint = "en"
+    # 3) Si uno es 25% más largo que el otro, elige el más largo
+    elif n_es >= n_en * 1.25 and n_es >= 3:
+        text_best = text_es
+        src_hint = "es"
+    elif n_en >= n_es * 1.25 and n_en >= 3:
+        text_best = text_en
+        src_hint = "en"
+    # (si nada de lo anterior aplica, dejamos lo que eligió el scoring previo)
 
-
+    # 4) ES ↔ EN garantizado (con sesgo a ES si hay duda)
     src = normalize_lang(src_hint)
     if src == "unknown":
         sguess = guess_lang_by_stops(text_best)
@@ -487,8 +490,10 @@ elif n_en >= n_es * 1.25 and n_en >= 3:
 
     dst = "en" if src == "es" else ("es" if src == "en" else "es")
 
+    # 5) Traducir (motor + glosario)
     translated = translate_smart(text_best, target=dst, source_lang=src if src in ("es","en") else None)
 
+    # --- Fallback anti ES→ES si detectó mal ---
     if src == "en":
         sim = jaccard_similarity(text_best, translated)
         if is_spanishish(text_best) or sim >= 0.75:
@@ -496,6 +501,7 @@ elif n_en >= n_es * 1.25 and n_en >= 3:
             dst = "en"
             translated = translate_smart(text_best, target=dst, source_lang="es")
 
+    # 6) Responder texto
     human_src = "Español" if src == "es" else "Inglés" if src == "en" else "desconocido"
     human_dst = "Inglés" if dst == "en" else "Español"
     reply_lines = []
@@ -508,6 +514,7 @@ elif n_en >= n_es * 1.25 and n_en >= 3:
     reply_lines.append(translated if translated else "(no disponible)")
     await update.message.reply_text("\n".join(reply_lines))
 
+    # 7) Audio de la traducción (documento — sin autoplay)
     if translated:
         out_mp3 = tf_in.name + ".mp3"
         if tts_to_mp3(translated, dst, out_mp3):
