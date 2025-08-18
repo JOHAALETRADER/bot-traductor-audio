@@ -9,7 +9,7 @@ import shutil
 import re
 from pathlib import Path
 
-# NUEVOS IMPORTS (para DeepL sin aiohttp)
+# DeepL con requests (sin aiohttp)
 import asyncio
 import requests
 
@@ -35,10 +35,11 @@ def normalize_lang(code: str) -> str:
 
 # ========= Modelos Vosk (ES y EN) =========
 MODELS_DIR = Path("/app/models")
-ES_MODEL_DIR = MODELS_DIR / "vosk-model-small-es-0.42"
+# USAR MODELO GRANDE DE ESPAÑOL (mejor calidad)
+ES_MODEL_DIR = MODELS_DIR / "vosk-model-es-0.42"
 EN_MODEL_DIR = MODELS_DIR / "vosk-model-small-en-us-0.15"
 
-ES_URL = "https://alphacephei.com/vosk/models/vosk-model-small-es-0.42.zip"
+ES_URL = "https://alphacephei.com/vosk/models/vosk-model-es-0.42.zip"
 EN_URL = "https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip"
 
 def ensure_model(model_dir: Path, url: str):
@@ -121,8 +122,10 @@ def jaccard_similarity(a: str, b: str) -> float:
     return inter / max(1, union)
 
 def strip_laughter_noises(t: str) -> str:
-    # elimina repeticiones típicas de risa y rellenos cortos
+    # elimina repeticiones típicas de risa, rellenos cortos y rarezas
     t = re.sub(r"\b(ja+|ha+|jaja+|jeje+|jiji+|ahaha+|eh+|uh+|mmm+)\b", " ", t, flags=re.I)
+    t = re.sub(r"[^\wáéíóúñÁÉÍÓÚÑ\s,.!?;:()-]", " ", t)
+    t = re.sub(r"\b\w{1}\b", " ", t)  # descarta tokens de 1 letra sueltos
     t = re.sub(r"\s{2,}", " ", t).strip()
     return t
 
@@ -263,14 +266,17 @@ def apply_local_glossary(text: str, direction: tuple[str,str]) -> str:
 
 def translate_smart(text: str, target: str, source_lang: str | None) -> str:
     """Intenta DeepL y cae a Google, luego aplica glosario local."""
+    # Refuerzo de idioma de origen si no viene claro
+    if not source_lang or source_lang not in ("es","en"):
+        guess = detect_lang(text)
+        if guess in ("es","en"):
+            source_lang = guess
+
     translated = translate_deepl(text, target, source_lang)
     if not translated:
         translated = translate_google(text, target, source_lang)
-    src_norm = (source_lang or "unknown")
-    if src_norm not in ("es","en"):
-        src_norm = detect_lang(text)
-    if src_norm not in ("es","en"):
-        src_norm = "es" if target.startswith("en") else "en"
+
+    src_norm = source_lang or ("es" if target.startswith("en") else "en")
     fixed = apply_local_glossary(translated, (src_norm, "en" if target.startswith("en") else "es"))
     return fixed
 
@@ -441,11 +447,12 @@ async def _process_audio_file(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text("No pude transcribir el audio.")
         return
 
-    # 3.1 Refuerzo ES/EN con limpieza de risas
-    text_es = strip_laughter_noises(text_es)
-    text_en = strip_laughter_noises(text_en)
+    # 3.1 Limpieza/normalización previa
+    text_es  = strip_laughter_noises(text_es)
+    text_en  = strip_laughter_noises(text_en)
     text_best = strip_laughter_noises(text_best)
 
+    # 3.2 Refuerzo ES/EN
     n_es, n_en = len(text_es.split()), len(text_en.split())
     es_hits = stop_hits(text_es, ES_STOPS)
     en_hits = stop_hits(text_en, EN_STOPS)
@@ -527,7 +534,6 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not audio:
         return
     tg_file = await audio.get_file()
-    # usar la extensión si la tenemos; si no, .mp3 por defecto
     suffix = os.path.splitext(audio.file_name or "audio.mp3")[1] or ".mp3"
     await _process_audio_file(update, context, tg_file, suffix)
 
@@ -541,7 +547,7 @@ async def handle_document_audio(update: Update, context: ContextTypes.DEFAULT_TY
         name.endswith(ext) for ext in (".mp3", ".m4a", ".wav", ".ogg", ".oga", ".opus")
     )
     if not is_audio_doc:
-        return  # ignoramos otros documentos
+        return
     tg_file = await doc.get_file()
     suffix = os.path.splitext(doc.file_name or "file.mp3")[1] or ".mp3"
     await _process_audio_file(update, context, tg_file, suffix)
@@ -559,7 +565,7 @@ def build_app():
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
     # Audios normales
     app.add_handler(MessageHandler(filters.AUDIO, handle_audio))
-    # Documentos con audio (ponlo al final para no interferir con VOICE/AUDIO)
+    # Documentos con audio (al final)
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document_audio))
     return app
 
