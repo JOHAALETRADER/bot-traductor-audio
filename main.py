@@ -177,11 +177,115 @@ def detect_lang(text: str) -> str:
     except Exception:
         return guess_lang_by_stops(text)
 
+# ========= DeepL (opcional) + Fallback Google =========
+USE_DEEPL = getenv_stripped("USE_DEEPL", "false").lower() in ("1", "true", "yes")
+DEEPL_API_KEY = getenv_stripped("DEEPL_API_KEY", "")
+DEEPL_API_HOST = getenv_stripped("DEEPL_API_HOST", "api.deepl.com")  # para "Pro"; si usas Free: api-free.deepl.com
+DEEPL_FORMALITY = getenv_stripped("DEEPL_FORMALITY", "default")      # default | more | less (o formal|informal)
+DEEPL_GLOSSARY_ID = getenv_stripped("DEEPL_GLOSSARY_ID", "")
+DEEPL_GLOSSARY_TSV = getenv_stripped("DEEPL_GLOSSARY_TSV", "")
+_DEEPL_GLOSSARY_ID_CACHE = None
+
+def _deepl_lang(code2: str) -> str:
+    # Mapa simple es/en -> ES/EN (puedes ajustar a EN-US si lo prefieres)
+    if not code2:
+        return ""
+    c = code2.lower()
+    if c.startswith("es"):
+        return "ES"
+    if c.startswith("en"):
+        return "EN"
+    return code2.upper()
+
+def deepl_create_glossary_if_needed(source_lang: str, target_lang: str) -> str:
+    """
+    Crea un glosario si:
+      - hay TSV en DEEPL_GLOSSARY_TSV
+      - NO hay DEEPL_GLOSSARY_ID
+    Cachea el ID en memoria.
+    """
+    global _DEEPL_GLOSSARY_ID_CACHE, DEEPL_GLOSSARY_ID
+    if _DEEPL_GLOSSARY_ID_CACHE:
+        return _DEEPL_GLOSSARY_ID_CACHE
+    if DEEPL_GLOSSARY_ID:
+        _DEEPL_GLOSSARY_ID_CACHE = DEEPL_GLOSSARY_ID
+        return DEEPL_GLOSSARY_ID
+    entries = (DEEPL_GLOSSARY_TSV or "").strip()
+    if not (USE_DEEPL and DEEPL_API_KEY and entries):
+        return ""
+
+    try:
+        import requests
+        url = f"https://{DEEPL_API_HOST}/v2/glossaries"
+        files = {
+            "name": (None, "JT Glossary ES-EN Auto"),
+            "source_lang": (None, _deepl_lang(source_lang) or "ES"),
+            "target_lang": (None, _deepl_lang(target_lang) or "EN"),
+            "entries": ("glossary.tsv", entries, "text/tab-separated-values"),
+        }
+        headers = {"Authorization": f"DeepL-Auth-Key {DEEPL_API_KEY}"}
+        r = requests.post(url, headers=headers, files=files, timeout=30)
+        if r.status_code == 200:
+            gid = r.json().get("glossary_id", "")
+            if gid:
+                _DEEPL_GLOSSARY_ID_CACHE = gid
+                DEEPL_GLOSSARY_ID = gid
+                return gid
+    except Exception:
+        pass
+    return ""
+
+def deepl_translate(text: str, *, source_lang: str | None, target_lang: str) -> str:
+    """
+    Traducción con DeepL. Usa glosario si está disponible o puede crearse.
+    """
+    if not (USE_DEEPL and DEEPL_API_KEY):
+        return ""
+
+    src = _deepl_lang(source_lang or "")
+    tgt = _deepl_lang(target_lang or "EN")
+    if not tgt:
+        tgt = "EN"
+
+    gid = DEEPL_GLOSSARY_ID or ""
+    if not gid and DEEPL_GLOSSARY_TSV:
+        gid = deepl_create_glossary_if_needed(src or "ES", tgt or "EN") or ""
+
+    data = {
+        "text": text,
+        "target_lang": tgt,
+    }
+    if src:
+        data["source_lang"] = src
+    if DEEPL_FORMALITY and DEEPL_FORMALITY != "default":
+        data["formality"] = DEEPL_FORMALITY
+    if gid:
+        data["glossary_id"] = gid
+
+    try:
+        import requests
+        url = f"https://{DEEPL_API_HOST}/v2/translate"
+        headers = {"Authorization": f"DeepL-Auth-Key {DEEPL_API_KEY}"}
+        r = requests.post(url, headers=headers, data=data, timeout=45)
+        if r.status_code == 200:
+            js = r.json()
+            return (js.get("translations", [{}])[0].get("text") or "").strip()
+        # Si DeepL falla, devolvemos vacío para que el caller use fallback.
+        return ""
+    except Exception:
+        return ""
+
 def translate(text: str, target: str, source_lang: str = None) -> str:
     """
-    Traduce con deep-translator.
-    source_lang puede ser 'es' o 'en'; si no se sabe, usa 'auto'.
+    Primero intenta DeepL (si está activado). Si no, usa GoogleTranslator (deep_translator).
     """
+    # 1) DeepL
+    if USE_DEEPL and DEEPL_API_KEY:
+        out = deepl_translate(text, source_lang=source_lang, target_lang=target)
+        if out:
+            return out
+
+    # 2) Fallback Google
     try:
         from deep_translator import GoogleTranslator
         src = source_lang if source_lang in ("es", "en") else "auto"
@@ -253,7 +357,6 @@ def adjust_speed_with_ffmpeg(in_mp3: str, out_mp3: str, speed: float) -> bool:
         except Exception:
             return False
 
-    # atempo válido 0.5–2.0
     cmd = [
         "ffmpeg", "-y", "-i", in_mp3,
         "-filter:a", f"atempo={spd}",
@@ -262,7 +365,6 @@ def adjust_speed_with_ffmpeg(in_mp3: str, out_mp3: str, speed: float) -> bool:
     res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     if res.returncode == 0 and os.path.exists(out_mp3) and os.path.getsize(out_mp3) > 0:
         return True
-    # fallback copia si algo falló
     try:
         shutil.copyfile(in_mp3, out_mp3)
         return True
