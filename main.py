@@ -6,6 +6,7 @@ import subprocess
 import tempfile
 import urllib.request
 import shutil
+import re
 from pathlib import Path
 
 from telegram import Update, InputFile
@@ -78,19 +79,15 @@ def pick_lang_by_score(text_es: str, text_en: str):
     n_en = len(text_en.split())
     h_es = stop_hits(text_es, ES_STOPS)
     h_en = stop_hits(text_en, EN_STOPS)
-
     score_es = n_es + 2*h_es
     score_en = n_en + 2*h_en
-
     if score_es == 0 and score_en == 0:
         return "", "unknown"
-
     if abs(score_es - score_en) <= 2:
         if h_es >= 1 and n_es >= 2:
             return text_es, "es"
         if h_en >= 1 and n_en >= 2:
             return text_en, "en"
-
     if score_es > score_en:
         return (text_es, "es" if n_es >= 2 else "unknown")
     else:
@@ -177,121 +174,89 @@ def detect_lang(text: str) -> str:
     except Exception:
         return guess_lang_by_stops(text)
 
-# ========= DeepL (opcional) + Fallback Google =========
-USE_DEEPL = getenv_stripped("USE_DEEPL", "false").lower() in ("1", "true", "yes")
+# ========= Traducción (DeepL -> Google) + Glosario Local =========
 DEEPL_API_KEY = getenv_stripped("DEEPL_API_KEY", "")
-DEEPL_API_HOST = getenv_stripped("DEEPL_API_HOST", "api.deepl.com")  # para "Pro"; si usas Free: api-free.deepl.com
-DEEPL_FORMALITY = getenv_stripped("DEEPL_FORMALITY", "default")      # default | more | less (o formal|informal)
-DEEPL_GLOSSARY_ID = getenv_stripped("DEEPL_GLOSSARY_ID", "")
-DEEPL_GLOSSARY_TSV = getenv_stripped("DEEPL_GLOSSARY_TSV", "")
-_DEEPL_GLOSSARY_ID_CACHE = None
+DEEPL_API_HOST = getenv_stripped("DEEPL_API_HOST", "api-free.deepl.com")
+USE_LOCAL_GLOSSARY = getenv_stripped("USE_LOCAL_GLOSSARY", "true").lower() in ("1","true","yes")
 
-def _deepl_lang(code2: str) -> str:
-    # Mapa simple es/en -> ES/EN (puedes ajustar a EN-US si lo prefieres)
-    if not code2:
+def translate_deepl(text: str, target: str, source_lang: str | None) -> str:
+    """Traduce con DeepL si hay API; si falla, devuelve '' para que otro motor tome el relevo."""
+    if not DEEPL_API_KEY:
         return ""
-    c = code2.lower()
-    if c.startswith("es"):
-        return "ES"
-    if c.startswith("en"):
-        return "EN"
-    return code2.upper()
+    import aiohttp, asyncio
+    # DeepL espera códigos como ES / EN (mayúsculas) y opcional source_lang
+    tgt = "EN" if target.startswith("en") else "ES"
+    src = "EN" if (source_lang or "").startswith("en") else ("ES" if (source_lang or "").startswith("es") else None)
 
-def deepl_create_glossary_if_needed(source_lang: str, target_lang: str) -> str:
-    """
-    Crea un glosario si:
-      - hay TSV en DEEPL_GLOSSARY_TSV
-      - NO hay DEEPL_GLOSSARY_ID
-    Cachea el ID en memoria.
-    """
-    global _DEEPL_GLOSSARY_ID_CACHE, DEEPL_GLOSSARY_ID
-    if _DEEPL_GLOSSARY_ID_CACHE:
-        return _DEEPL_GLOSSARY_ID_CACHE
-    if DEEPL_GLOSSARY_ID:
-        _DEEPL_GLOSSARY_ID_CACHE = DEEPL_GLOSSARY_ID
-        return DEEPL_GLOSSARY_ID
-    entries = (DEEPL_GLOSSARY_TSV or "").strip()
-    if not (USE_DEEPL and DEEPL_API_KEY and entries):
-        return ""
-
-    try:
-        import requests
-        url = f"https://{DEEPL_API_HOST}/v2/glossaries"
-        files = {
-            "name": (None, "JT Glossary ES-EN Auto"),
-            "source_lang": (None, _deepl_lang(source_lang) or "ES"),
-            "target_lang": (None, _deepl_lang(target_lang) or "EN"),
-            "entries": ("glossary.tsv", entries, "text/tab-separated-values"),
-        }
-        headers = {"Authorization": f"DeepL-Auth-Key {DEEPL_API_KEY}"}
-        r = requests.post(url, headers=headers, files=files, timeout=30)
-        if r.status_code == 200:
-            gid = r.json().get("glossary_id", "")
-            if gid:
-                _DEEPL_GLOSSARY_ID_CACHE = gid
-                DEEPL_GLOSSARY_ID = gid
-                return gid
-    except Exception:
-        pass
-    return ""
-
-def deepl_translate(text: str, *, source_lang: str | None, target_lang: str) -> str:
-    """
-    Traducción con DeepL. Usa glosario si está disponible o puede crearse.
-    """
-    if not (USE_DEEPL and DEEPL_API_KEY):
-        return ""
-
-    src = _deepl_lang(source_lang or "")
-    tgt = _deepl_lang(target_lang or "EN")
-    if not tgt:
-        tgt = "EN"
-
-    gid = DEEPL_GLOSSARY_ID or ""
-    if not gid and DEEPL_GLOSSARY_TSV:
-        gid = deepl_create_glossary_if_needed(src or "ES", tgt or "EN") or ""
-
-    data = {
-        "text": text,
-        "target_lang": tgt,
-    }
-    if src:
-        data["source_lang"] = src
-    if DEEPL_FORMALITY and DEEPL_FORMALITY != "default":
-        data["formality"] = DEEPL_FORMALITY
-    if gid:
-        data["glossary_id"] = gid
-
-    try:
-        import requests
+    async def _go():
         url = f"https://{DEEPL_API_HOST}/v2/translate"
-        headers = {"Authorization": f"DeepL-Auth-Key {DEEPL_API_KEY}"}
-        r = requests.post(url, headers=headers, data=data, timeout=45)
-        if r.status_code == 200:
-            js = r.json()
-            return (js.get("translations", [{}])[0].get("text") or "").strip()
-        # Si DeepL falla, devolvemos vacío para que el caller use fallback.
-        return ""
+        data = {"auth_key": DEEPL_API_KEY, "text": text, "target_lang": tgt}
+        if src:
+            data["source_lang"] = src
+        timeout = aiohttp.ClientTimeout(total=30)
+        async with aiohttp.ClientSession(timeout=timeout) as sess:
+            async with sess.post(url, data=data) as r:
+                if r.status != 200:
+                    return ""
+                js = await r.json()
+                return (js.get("translations", [{}])[0].get("text") or "").strip()
+    try:
+        # como estamos en sync, corremos un loop temporal
+        return asyncio.run(_go())
     except Exception:
         return ""
 
-def translate(text: str, target: str, source_lang: str = None) -> str:
-    """
-    Primero intenta DeepL (si está activado). Si no, usa GoogleTranslator (deep_translator).
-    """
-    # 1) DeepL
-    if USE_DEEPL and DEEPL_API_KEY:
-        out = deepl_translate(text, source_lang=source_lang, target_lang=target)
-        if out:
-            return out
-
-    # 2) Fallback Google
+def translate_google(text: str, target: str, source_lang: str | None) -> str:
     try:
         from deep_translator import GoogleTranslator
-        src = source_lang if source_lang in ("es", "en") else "auto"
+        src = source_lang if source_lang in ("es","en") else "auto"
         return GoogleTranslator(source=src, target=target).translate(text) or ""
     except Exception:
         return ""
+
+# --- Glosario local (post-proceso) ---
+# Direccional: ES->EN y EN->ES.  Reglas mínimas, case-insensitive, con límites de palabra.
+ES_EN_RULES = [
+    (r"\bdep[oó]sito[s]?\s+m[ií]nimo[s]?\b", "minimum deposit"),
+    (r"\bse[ñn]al(es)?\b", "signal"),
+    (r"\bapalancamiento\b", "leverage"),
+    (r"\bcuenta[s]?\b", "account"),
+    (r"\bretirad[ao]s?\b", "withdrawal"),
+]
+EN_ES_RULES = [
+    (r"\bminimum\s+deposit(s)?\b", "depósito mínimo"),
+    (r"\bsignal(s)?\b", "señal"),
+    (r"\bleverage\b", "apalancamiento"),
+    (r"\baccount(s)?\b", "cuenta"),
+    (r"\bwithdrawal(s)?\b", "retiro"),
+]
+
+def apply_local_glossary(text: str, direction: tuple[str,str]) -> str:
+    """direction = ('es','en') o ('en','es')"""
+    if not USE_LOCAL_GLOSSARY or not text:
+        return text
+    src, dst = direction
+    rules = ES_EN_RULES if (src=="es" and dst=="en") else (EN_ES_RULES if (src=="en" and dst=="es") else [])
+    out = text
+    for pattern, repl in rules:
+        out = re.sub(pattern, repl, out, flags=re.IGNORECASE)
+    return out
+
+def translate_smart(text: str, target: str, source_lang: str | None) -> str:
+    """Intenta DeepL y cae a Google, luego aplica glosario local."""
+    # 1) motor
+    translated = translate_deepl(text, target, source_lang)
+    if not translated:
+        translated = translate_google(text, target, source_lang)
+    # 2) post-proceso
+    src_norm = (source_lang or "unknown")
+    if src_norm not in ("es","en"):
+        src_norm = detect_lang(text)
+    if src_norm not in ("es","en"):
+        # si no se sabe, deduce por target
+        src_norm = "es" if target.startswith("en") else "en"
+    fixed = apply_local_glossary(translated, (src_norm, "en" if target.startswith("en") else "es"))
+    return fixed
 
 # ========= TTS (ElevenLabs -> fallback gTTS) =========
 def synthesize_tts(text: str, lang_code: str, out_mp3_path: str, slow: bool = False) -> bool:
@@ -320,7 +285,6 @@ def synthesize_tts(text: str, lang_code: str, out_mp3_path: str, slow: bool = Fa
                     "similarity_boost": 0.8,
                     "style": 0.0,
                     "use_speaker_boost": True
-                    # Nota: velocidad se ajusta luego con FFmpeg (atempo), para mantener tono.
                 }
             }
             r = requests.post(url, headers=headers, json=payload, timeout=60)
@@ -342,26 +306,18 @@ def synthesize_tts(text: str, lang_code: str, out_mp3_path: str, slow: bool = Fa
         return False
 
 def adjust_speed_with_ffmpeg(in_mp3: str, out_mp3: str, speed: float) -> bool:
-    """
-    Ajusta la velocidad manteniendo tono con FFmpeg atempo (0.5–2.0).
-    """
+    """Ajusta la velocidad manteniendo tono con FFmpeg atempo (0.5–2.0)."""
     try:
         spd = max(0.5, min(2.0, float(speed)))
     except Exception:
         spd = 1.0
     if abs(spd - 1.0) < 1e-3:
-        # Sin cambio: copia
         try:
             shutil.copyfile(in_mp3, out_mp3)
             return True
         except Exception:
             return False
-
-    cmd = [
-        "ffmpeg", "-y", "-i", in_mp3,
-        "-filter:a", f"atempo={spd}",
-        "-vn", out_mp3
-    ]
+    cmd = ["ffmpeg", "-y", "-i", in_mp3, "-filter:a", f"atempo={spd}", "-vn", out_mp3]
     res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     if res.returncode == 0 and os.path.exists(out_mp3) and os.path.getsize(out_mp3) > 0:
         return True
@@ -372,9 +328,7 @@ def adjust_speed_with_ffmpeg(in_mp3: str, out_mp3: str, speed: float) -> bool:
         return False
 
 def tts_to_mp3(text: str, lang_code: str, out_mp3_path: str, slow: bool = False) -> bool:
-    """
-    Orquesta: sintetiza (Eleven/gTTS) y luego aplica TTS_SPEED con FFmpeg atempo.
-    """
+    """Orquesta: sintetiza (Eleven/gTTS) y luego aplica TTS_SPEED con FFmpeg atempo."""
     raw_mp3 = out_mp3_path + ".raw.mp3"
     ok = synthesize_tts(text, lang_code, raw_mp3, slow=slow)
     if not ok:
@@ -423,10 +377,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif src == "en":
         dst = "es"
     else:
-        # si dudamos, forzamos a español como salida
         dst = "es"
 
-    translated = translate(text_in, target=dst, source_lang=src if src in ("es", "en") else None)
+    # Traducción + post-proceso
+    translated = translate_smart(text_in, target=dst, source_lang=src if src in ("es","en") else None)
 
     # Responder texto
     human_src = "Español" if src == "es" else "Inglés" if src == "en" else "desconocido"
@@ -450,22 +404,13 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.UPLOAD_AUDIO)
             except Exception:
                 pass
-            send_as_document = True  # FORZAR DOCUMENTO
             performer = (update.effective_user.first_name or "Johanna").strip()
             title = f"Traducción ({'EN' if dst == 'en' else 'ES'})"
             with open(out_mp3, "rb") as f:
-                if send_as_document:
-                    await update.message.reply_document(
-                        document=InputFile(f, filename=f"{title}.mp3"),
-                        caption=f"{title} — {performer}"
-                    )
-                else:
-                    await update.message.reply_audio(
-                        audio=InputFile(f, filename=f"{title}.mp3"),
-                        title=title,
-                        performer=performer,
-                        caption=title
-                    )
+                await update.message.reply_document(
+                    document=InputFile(f, filename=f"{title}.mp3"),
+                    caption=f"{title} — {performer}"
+                )
         else:
             await update.message.reply_text("No pude generar el audio de la traducción (TTS).")
 
@@ -501,7 +446,6 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # === BLOQUE DE COHERENCIA ES/EN (refuerzo) ===
     es_hits = stop_hits(text_es, ES_STOPS)
     en_hits = stop_hits(text_en, EN_STOPS)
-
     if es_hits >= max(2, en_hits + 1) and len(text_es.split()) >= 2:
         text_best = text_es
         src_hint = "es"
@@ -518,15 +462,10 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         sguess = guess_lang_by_stops(text_best)
         src = sguess if sguess != "unknown" else detect_lang(text_best)
 
-    if src == "es":
-        dst = "en"
-    elif src == "en":
-        dst = "es"
-    else:
-        dst = "es"  # preferimos salida en ES si seguimos dudando
+    dst = "en" if src == "es" else ("es" if src == "en" else "es")
 
-    # 5) Traducir (forzando source cuando se sabe)
-    translated = translate(text_best, target=dst, source_lang=src if src in ("es", "en") else None)
+    # 5) Traducir (motor + post-proceso)
+    translated = translate_smart(text_best, target=dst, source_lang=src if src in ("es","en") else None)
 
     # --- Fallback anti ES→ES si detectó mal ---
     if src == "en":
@@ -534,7 +473,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if is_spanishish(text_best) or sim >= 0.75:
             src = "es"
             dst = "en"
-            translated = translate(text_best, target=dst, source_lang="es")
+            translated = translate_smart(text_best, target=dst, source_lang="es")
 
     # 6) Responder texto
     human_src = "Español" if src == "es" else "Inglés" if src == "en" else "desconocido"
@@ -549,7 +488,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply_lines.append(translated if translated else "(no disponible)")
     await update.message.reply_text("\n".join(reply_lines))
 
-    # 7) Audio de la traducción (FORZAR DOCUMENTO — sin autoplay)
+    # 7) Audio de la traducción (documento — sin autoplay)
     if translated:
         out_mp3 = tf_in.name + ".mp3"
         if tts_to_mp3(translated, dst, out_mp3):
@@ -557,24 +496,13 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.UPLOAD_AUDIO)
             except Exception:
                 pass
-
-            send_as_document = True  # Evita autoplay en cadena
             performer = (update.effective_user.first_name or "Johanna").strip()
             title = f"Traducción ({'EN' if dst == 'en' else 'ES'})"
-
             with open(out_mp3, "rb") as f:
-                if send_as_document:
-                    await update.message.reply_document(
-                        document=InputFile(f, filename=f"{title}.mp3"),
-                        caption=f"{title} — {performer}"
-                    )
-                else:
-                    await update.message.reply_audio(
-                        audio=InputFile(f, filename=f"{title}.mp3"),
-                        title=title,
-                        performer=performer,
-                        caption=title
-                    )
+                await update.message.reply_document(
+                    document=InputFile(f, filename=f"{title}.mp3"),
+                    caption=f"{title} — {performer}"
+                )
         else:
             await update.message.reply_text("No pude generar el audio de la traducción (TTS).")
 
