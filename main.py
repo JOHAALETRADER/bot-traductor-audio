@@ -5,6 +5,7 @@ import zipfile
 import subprocess
 import tempfile
 import urllib.request
+import shutil
 from pathlib import Path
 
 from telegram import Update, InputFile
@@ -95,6 +96,22 @@ def pick_lang_by_score(text_es: str, text_en: str):
     else:
         return (text_en, "en" if n_en >= 2 else "unknown")
 
+# === Utilidades extra para robustez ES→EN ===
+def is_spanishish(text: str) -> bool:
+    """Señales rápidas de español: tildes o muchas stopwords ES."""
+    if any(c in text for c in "áéíóúñ¿¡"):
+        return True
+    return stop_hits(text, ES_STOPS) >= 2
+
+def jaccard_similarity(a: str, b: str) -> float:
+    sa = set((a or "").lower().split())
+    sb = set((b or "").lower().split())
+    if not sa or not sb:
+        return 0.0
+    inter = len(sa & sb)
+    union = len(sa | sb)
+    return inter / max(1, union)
+
 # === Transcripción Vosk: devuelve (text_best, src_hint, text_es, text_en) ===
 def vosk_transcribe_both(wav_path: str):
     """
@@ -173,15 +190,15 @@ def translate(text: str, target: str, source_lang: str = None) -> str:
         return ""
 
 # ========= TTS (ElevenLabs -> fallback gTTS) =========
-def tts_to_mp3(text: str, lang_code: str, out_mp3_path: str, slow: bool = False) -> bool:
+def synthesize_tts(text: str, lang_code: str, out_mp3_path: str, slow: bool = False) -> bool:
     """
-    1) Si ELEVEN_API_KEY + ELEVEN_VOICE_ID -> ElevenLabs (voz clonada).
-    2) Si falla o no hay credenciales -> gTTS.
+    1) Si ELEVEN_API_KEY + ELEVEN_VOICE_ID -> ElevenLabs (voz principal).
+    2) Si falla o no hay credenciales -> gTTS (fallback).
     """
     eleven_api_key = os.getenv("ELEVEN_API_KEY", "").strip()
     eleven_voice_id = os.getenv("ELEVEN_VOICE_ID", "").strip()
 
-    # ElevenLabs
+    # ElevenLabs (principal)
     if eleven_api_key and eleven_voice_id:
         try:
             import requests
@@ -199,6 +216,7 @@ def tts_to_mp3(text: str, lang_code: str, out_mp3_path: str, slow: bool = False)
                     "similarity_boost": 0.8,
                     "style": 0.0,
                     "use_speaker_boost": True
+                    # Nota: velocidad se ajusta luego con FFmpeg (atempo), para mantener tono.
                 }
             }
             r = requests.post(url, headers=headers, json=payload, timeout=60)
@@ -209,7 +227,7 @@ def tts_to_mp3(text: str, lang_code: str, out_mp3_path: str, slow: bool = False)
         except Exception:
             pass  # fallback a gTTS
 
-    # gTTS
+    # gTTS (fallback)
     try:
         from gtts import gTTS
         tld = "com.mx" if lang_code.startswith("es") else "com"
@@ -218,6 +236,58 @@ def tts_to_mp3(text: str, lang_code: str, out_mp3_path: str, slow: bool = False)
         return True
     except Exception:
         return False
+
+def adjust_speed_with_ffmpeg(in_mp3: str, out_mp3: str, speed: float) -> bool:
+    """
+    Ajusta la velocidad manteniendo tono con FFmpeg atempo (0.5–2.0).
+    """
+    try:
+        spd = max(0.5, min(2.0, float(speed)))
+    except Exception:
+        spd = 1.0
+    if abs(spd - 1.0) < 1e-3:
+        # Sin cambio: copia
+        try:
+            shutil.copyfile(in_mp3, out_mp3)
+            return True
+        except Exception:
+            return False
+
+    # atempo válido 0.5–2.0
+    cmd = [
+        "ffmpeg", "-y", "-i", in_mp3,
+        "-filter:a", f"atempo={spd}",
+        "-vn", out_mp3
+    ]
+    res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if res.returncode == 0 and os.path.exists(out_mp3) and os.path.getsize(out_mp3) > 0:
+        return True
+    # fallback copia si algo falló
+    try:
+        shutil.copyfile(in_mp3, out_mp3)
+        return True
+    except Exception:
+        return False
+
+def tts_to_mp3(text: str, lang_code: str, out_mp3_path: str, slow: bool = False) -> bool:
+    """
+    Orquesta: sintetiza (Eleven/gTTS) y luego aplica TTS_SPEED con FFmpeg atempo.
+    """
+    raw_mp3 = out_mp3_path + ".raw.mp3"
+    ok = synthesize_tts(text, lang_code, raw_mp3, slow=slow)
+    if not ok:
+        return False
+    speed = getenv_stripped("TTS_SPEED", "1.0")
+    try:
+        spd = float(speed)
+    except Exception:
+        spd = 1.0
+    ok2 = adjust_speed_with_ffmpeg(raw_mp3, out_mp3_path, spd)
+    try:
+        os.remove(raw_mp3)
+    except Exception:
+        pass
+    return ok2
 
 # ========= Handlers =========
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -326,24 +396,23 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("No pude transcribir el audio.")
         return
 
-    # === NUEVO BLOQUE DE COHERENCIA ES/EN ===
-    # Si los stopwords inclinan claramente a ES/EN, fuerza idioma y texto correspondiente.
-    # Esto corrige los casos en los que Vosk elige un "best" incorrecto por longitud/ruido.
-    forced_lang = guess_lang_by_stops(text_best)
+    # === BLOQUE DE COHERENCIA ES/EN (refuerzo) ===
     es_hits = stop_hits(text_es, ES_STOPS)
     en_hits = stop_hits(text_en, EN_STOPS)
 
     if es_hits >= max(2, en_hits + 1) and len(text_es.split()) >= 2:
         text_best = text_es
         src_hint = "es"
-    elif en_hits >= max(2, es_hits + 1) and len(text_en.split()) >= 2:
+    elif en_hits >= max(3, es_hits + 2) and len(text_en.split()) >= 2:
         text_best = text_en
         src_hint = "en"
+    elif is_spanishish(text_es) and len(text_es.split()) >= 2 and len(text_es.split()) >= len(text_en.split()) - 1:
+        text_best = text_es
+        src_hint = "es"
 
     # 4) ES ↔ EN garantizado (con sesgo a ES si hay duda)
     src = normalize_lang(src_hint)
     if src == "unknown":
-        # refuerzo: si stops en ES detectan idioma, fuerza ES
         sguess = guess_lang_by_stops(text_best)
         src = sguess if sguess != "unknown" else detect_lang(text_best)
 
@@ -356,6 +425,14 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # 5) Traducir (forzando source cuando se sabe)
     translated = translate(text_best, target=dst, source_lang=src if src in ("es", "en") else None)
+
+    # --- Fallback anti ES→ES si detectó mal ---
+    if src == "en":
+        sim = jaccard_similarity(text_best, translated)
+        if is_spanishish(text_best) or sim >= 0.75:
+            src = "es"
+            dst = "en"
+            translated = translate(text_best, target=dst, source_lang="es")
 
     # 6) Responder texto
     human_src = "Español" if src == "es" else "Inglés" if src == "en" else "desconocido"
@@ -379,19 +456,17 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 pass
 
-            send_as_document = True  # FORZAR DOCUMENTO
+            send_as_document = True  # Evita autoplay en cadena
             performer = (update.effective_user.first_name or "Johanna").strip()
             title = f"Traducción ({'EN' if dst == 'en' else 'ES'})"
 
             with open(out_mp3, "rb") as f:
                 if send_as_document:
-                    # Evita autoplay
                     await update.message.reply_document(
                         document=InputFile(f, filename=f"{title}.mp3"),
                         caption=f"{title} — {performer}"
                     )
                 else:
-                    # Audio con metadatos
                     await update.message.reply_audio(
                         audio=InputFile(f, filename=f"{title}.mp3"),
                         title=title,
