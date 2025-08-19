@@ -18,6 +18,18 @@ from telegram import Update, InputFile
 from telegram.constants import ChatAction
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 
+# ========= Acceso por múltiples IDs (NUEVO) =========
+# Si no se define ALLOWED_USERS en env, por defecto permite 5958164558
+ALLOWED_USERS = os.getenv("ALLOWED_USERS", "5958164558").split(",")
+ALLOWED_USERS = [uid.strip() for uid in ALLOWED_USERS if uid.strip()]
+
+def is_allowed(update: Update) -> bool:
+    try:
+        uid = str(update.effective_user.id)
+        return (uid in ALLOWED_USERS) if ALLOWED_USERS else True
+    except Exception:
+        return False
+
 # ========= Utilidades de entorno =========
 def getenv_stripped(name: str, default: str = "") -> str:
     val = os.getenv(name, default)
@@ -378,6 +390,13 @@ def tts_to_mp3(text: str, lang_code: str, out_mp3_path: str, slow: bool = False)
 
 # ========= Handlers =========
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        try:
+            await update.message.reply_text("Bot privado: acceso no autorizado.")
+        except Exception:
+            pass
+        return
+
     msg = (
         "Traductor de audios y texto:\n"
         "• Nota de voz ES → EN (texto + audio)\n"
@@ -389,10 +408,23 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg)
 
 async def health(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        try:
+            await update.message.reply_text("Bot privado: acceso no autorizado.")
+        except Exception:
+            pass
+        return
     await update.message.reply_text("ok")
 
 # ---- Texto a audio (ES<->EN) ----
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        try:
+            await update.message.reply_text("Bot privado: acceso no autorizado.")
+        except Exception:
+            pass
+        return
+
     text_in = (update.message.text or "").strip()
     if not text_in:
         return
@@ -510,6 +542,12 @@ async def _process_audio_file(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 # ---- Nota de voz (VOICE) ----
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        try:
+            await update.message.reply_text("Bot privado: acceso no autorizado.")
+        except Exception:
+            pass
+        return
     voice = update.message.voice
     if not voice:
         return
@@ -518,6 +556,12 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ---- Audio normal (AUDIO) ----
 async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        try:
+            await update.message.reply_text("Bot privado: acceso no autorizado.")
+        except Exception:
+            pass
+        return
     audio = update.message.audio
     if not audio:
         return
@@ -527,6 +571,12 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ---- Documento con audio (DOCUMENT) ----
 async def handle_document_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        try:
+            await update.message.reply_text("Bot privado: acceso no autorizado.")
+        except Exception:
+            pass
+        return
     doc = update.message.document
     if not doc:
         return
