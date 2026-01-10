@@ -141,10 +141,45 @@ def strip_laughter_noises(t: str) -> str:
     t = re.sub(r"\s{2,}", " ", t).strip()
     return t
 
+# ========= Limpieza de "emoji words" =========
+# Vosk/STT a veces convierte emojis en palabras ("party popper", "red heart", etc.)
+# Esto las elimina antes de detectar idioma / traducir.
+EMOJI_WORDS = [
+    "party popper",
+    "red heart",
+    "blue heart",
+    "green heart",
+    "yellow heart",
+    "purple heart",
+    "black heart",
+    "white heart",
+    "fire",
+    "rocket",
+    "hundred points",
+    "trophy",
+    "clapping hands",
+    "smiling face",
+    "grinning face",
+    "face with tears of joy",
+    "sparkles",
+    "star",
+    "check mark",
+    "warning",
+]
+
+_EMOJI_WORDS_RE = re.compile(
+    r"\b(" + "|".join(re.escape(w) for w in EMOJI_WORDS) + r")\b",
+    flags=re.IGNORECASE
+)
+
+def remove_emoji_words(text: str) -> str:
+    if not text:
+        return text
+    t = _EMOJI_WORDS_RE.sub(" ", text)
+    t = re.sub(r"\s{2,}", " ", t).strip()
+    return t
+
 # ========= Reconocimiento Vosk =========
-# 🔧 CAMBIO CLAVE:
-# Antes: default "es" -> forzaba español y dañaba audios EN
-# Ahora: default "auto" -> decide mejor para audios en inglés/español
 FORCE_STT_LANG = getenv_stripped("FORCE_STT_LANG", "auto").lower()  # 'es' | 'en' | 'auto'
 
 def vosk_transcribe_both(wav_path: str):
@@ -195,6 +230,10 @@ def vosk_transcribe_both(wav_path: str):
         except Exception:
             text_en = ""
 
+    # Limpieza de emoji-words ANTES de elegir
+    text_es = remove_emoji_words(text_es)
+    text_en = remove_emoji_words(text_en)
+
     # Fuerza directa
     if FORCE_STT_LANG == "es":
         return (text_es, "es" if text_es else "unknown", text_es, text_en)
@@ -203,6 +242,8 @@ def vosk_transcribe_both(wav_path: str):
 
     # AUTO: escoger mejor por score
     best, hint = pick_lang_by_score(text_es, text_en)
+    best = remove_emoji_words(best)
+
     if not best:
         if text_es:
             return text_es, "es", text_es, text_en
@@ -481,6 +522,9 @@ async def _process_audio_file(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not text_best:
         await update.message.reply_text("No pude transcribir el audio.")
         return
+
+    # Extra: limpia cualquier emoji-word que se haya colado
+    text_best = remove_emoji_words(text_best)
 
     # 4) Decidir direcciones
     src = normalize_lang(src_hint)
