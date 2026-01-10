@@ -125,6 +125,9 @@ def is_spanishish(text: str) -> bool:
         return True
     return stop_hits(text, ES_STOPS) >= 2
 
+def is_englishish(text: str) -> bool:
+    return stop_hits(text, EN_STOPS) >= 2
+
 def jaccard_similarity(a: str, b: str) -> float:
     sa = set((a or "").lower().split())
     sb = set((b or "").lower().split())
@@ -142,13 +145,34 @@ def strip_laughter_noises(t: str) -> str:
     return t
 
 # ========= Reconocimiento Vosk =========
-FORCE_STT_LANG = getenv_stripped("FORCE_STT_LANG", "es").lower()  # 'es' | 'en' | 'auto'
+# 🔧 CAMBIO CLAVE:
+# Antes: default "es" -> forzaba español y dañaba audios EN
+# Ahora: default "auto" -> decide mejor para audios en inglés/español
+FORCE_STT_LANG = getenv_stripped("FORCE_STT_LANG", "auto").lower()  # 'es' | 'en' | 'auto'
+
+def should_run_en_in_auto(text_es: str) -> bool:
+    """
+    En AUTO: correr el modelo EN sólo si el resultado ES no parece español
+    (evita gastar CPU siempre, pero arregla audios en inglés).
+    """
+    if not text_es:
+        return True
+    # Si tiene señales claras de español, no hace falta EN
+    if is_spanishish(text_es):
+        return False
+    # Si no tiene señales de español y además tiene pocas palabras o pinta a inglés, sí corre EN
+    if len(text_es.split()) <= 4:
+        return True
+    if is_englishish(text_es):
+        return True
+    # si no hay señales claras de nada, corre EN para comparar
+    return True
 
 def vosk_transcribe_both(wav_path: str):
     """
     Retorna (text_best, src_hint, text_es, text_en)
     src_hint: 'es' | 'en' | 'unknown'
-    Respeta FORCE_STT_LANG (por defecto 'es').
+    Respeta FORCE_STT_LANG (por defecto 'auto').
     """
     try:
         import vosk
@@ -158,7 +182,7 @@ def vosk_transcribe_both(wav_path: str):
     text_es = ""
     text_en = ""
 
-    # Siempre cargamos ES (principal)
+    # Siempre intentamos ES (principal)
     try:
         ensure_model(ES_MODEL_DIR, ES_URL)
         model_es = __import__("vosk").Model(str(ES_MODEL_DIR))
@@ -174,8 +198,14 @@ def vosk_transcribe_both(wav_path: str):
     except Exception:
         text_es = ""
 
-    # Dependiendo del modo, ejecutamos EN también
-    run_en = (FORCE_STT_LANG == "auto") or (FORCE_STT_LANG == "en")
+    # Decidir si corremos EN
+    if FORCE_STT_LANG == "en":
+        run_en = True
+    elif FORCE_STT_LANG == "auto":
+        run_en = should_run_en_in_auto(text_es)
+    else:
+        run_en = False  # FORCE_STT_LANG == "es"
+
     if run_en:
         try:
             ensure_model(EN_MODEL_DIR, EN_URL)
@@ -198,7 +228,7 @@ def vosk_transcribe_both(wav_path: str):
     if FORCE_STT_LANG == "en":
         return (text_en, "en" if text_en else "unknown", text_es, text_en)
 
-    # AUTO: elegir por puntuación y refuerzo
+    # AUTO: elegir por puntuación
     best, hint = pick_lang_by_score(text_es, text_en)
     if not best:
         if text_es:
@@ -207,18 +237,6 @@ def vosk_transcribe_both(wav_path: str):
             return text_en, "en", text_es, text_en
         return "", "unknown", text_es, text_en
 
-    # Refuerzo fuerte a ES si hay señales
-    n_es, n_en = len(text_es.split()), len(text_en.split())
-    es_hits = stop_hits(text_es, ES_STOPS)
-    en_hits = stop_hits(text_en, EN_STOPS)
-    if es_hits >= 1 and n_es >= max(3, n_en - 2):
-        return text_es, "es", text_es, text_en
-    if en_hits >= 2 and n_en >= max(3, n_es + 1):
-        return text_en, "en", text_es, text_en
-    if n_es >= n_en * 1.25 and n_es >= 3:
-        return text_es, "es", text_es, text_en
-    if n_en >= n_es * 1.25 and n_en >= 3:
-        return text_en, "en", text_es, text_en
     return best, hint, text_es, text_en
 
 def detect_lang(text: str) -> str:
@@ -251,10 +269,14 @@ def translate_deepl(text: str, target: str, source_lang: Optional[str]) -> str:
     try:
         def _post():
             return requests.post(url, data=data, timeout=30)
+
+        # Nota: si estamos dentro del loop async, esto puede bloquear; lo dejamos así
+        # porque tu bot ya funciona y priorizamos no romper nada.
         try:
             resp = asyncio.get_event_loop().run_until_complete(asyncio.to_thread(_post))
         except Exception:
             resp = requests.post(url, data=data, timeout=30)
+
         if resp.status_code != 200:
             return ""
         js = resp.json()
@@ -485,7 +507,7 @@ async def _process_audio_file(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text("No pude convertir el audio. Revisa FFmpeg (agrega apt.txt con 'ffmpeg').")
         return
 
-    # 3) Transcribir
+    # 3) Transcribir (AUTO robusto)
     text_best, src_hint, text_es, text_en = vosk_transcribe_both(wav_path)
     if not text_best:
         await update.message.reply_text("No pude transcribir el audio.")
@@ -496,17 +518,29 @@ async def _process_audio_file(update: Update, context: ContextTypes.DEFAULT_TYPE
     if src == "unknown":
         sguess = guess_lang_by_stops(text_best)
         src = sguess if sguess != "unknown" else detect_lang(text_best)
+
+    # 🔧 SEGURO EXTRA:
+    # Si quedó como ES pero NO parece español y el EN se ve mejor, corrige a EN.
+    if src == "es":
+        if (not is_spanishish(text_best)) and text_en:
+            # si EN tiene señales de inglés o mejor score, úsalo
+            best2, hint2 = pick_lang_by_score(text_es, text_en)
+            if hint2 == "en" and best2 == text_en:
+                text_best = text_en
+                src = "en"
+
+    # Si quedó como EN pero parece español y ES es claramente mejor, corrige a ES.
+    if src == "en":
+        if is_spanishish(text_best) and text_es:
+            best2, hint2 = pick_lang_by_score(text_es, text_en)
+            if hint2 == "es" and best2 == text_es:
+                text_best = text_es
+                src = "es"
+
     dst = "en" if src == "es" else ("es" if src == "en" else "es")
 
     # 5) Traducir
     translated = translate_smart(text_best, target=dst, source_lang=src if src in ("es","en") else None)
-
-    # fallback si detectó mal
-    if src == "en":
-        sim = jaccard_similarity(text_best, translated)
-        if is_spanishish(text_best) or sim >= 0.75:
-            src, dst = "es", "en"
-            translated = translate_smart(text_best, target=dst, source_lang="es")
 
     # 6) Respuesta textual
     human_src = "Español" if src == "es" else "Inglés" if src == "en" else "desconocido"
