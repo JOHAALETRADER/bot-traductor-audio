@@ -296,7 +296,17 @@ def clean_copied_translation(text):
         r"(?im)^Original:\s*\n(?P<original>.*?)(?=^Traducci[oó]n\s*\([^\n]*\)\s*:|\Z)",
         text, re.DOTALL | re.IGNORECASE | re.MULTILINE,
     )
-    return match.group("original").strip() if match else text.strip()
+    if match:
+        return match.group("original").strip()
+    # La respuesta traducida de este bot también puede reenviarse como texto.
+    # Su encabezado identifica el idioma, pero nunca forma parte del mensaje hablado.
+    cleaned = text.strip()
+    cleaned = re.sub(
+        r"\A(?:Traducci[oó]n\s*\([^\n]*\)|Traducci[oó]n\s+en\s+(?:espa[ñn]ol|ingl[eé]s)|"
+        r"Translation\s*\([^\n]*\)|(?:English|Spanish)\s+translation)\s*:\s*\n?",
+        "", cleaned, count=1, flags=re.IGNORECASE,
+    )
+    return cleaned.strip()
 
 
 def prepare_message(text):
