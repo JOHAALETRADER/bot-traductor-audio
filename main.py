@@ -9,6 +9,8 @@ import shutil
 import re
 import wave
 import uuid
+import logging
+from urllib.parse import urlsplit
 from pathlib import Path
 from typing import Optional
 
@@ -274,6 +276,28 @@ DEEPL_API_KEY = getenv_stripped("DEEPL_API_KEY", "")
 DEEPL_API_HOST = getenv_stripped("DEEPL_API_HOST", "api-free.deepl.com")
 USE_DEEPL = getenv_stripped("USE_DEEPL", "true").lower() in ("1", "true", "yes")
 USE_LOCAL_GLOSSARY = getenv_stripped("USE_LOCAL_GLOSSARY", "false").lower() in ("1","true","yes")
+LOGGER = logging.getLogger(__name__)
+URL_RE = re.compile(r"https?://[^\s<>]+", re.IGNORECASE)
+
+
+def split_links(text):
+    """Mantiene URL exactas fuera del traductor y de la voz."""
+    links = []
+    def remove(match):
+        value = match.group(0).rstrip('.,;!?)"]')
+        links.append(value)
+        return " " + match.group(0)[len(value):]
+    return URL_RE.sub(remove, text).strip(), links
+
+
+def deepl_host():
+    host = DEEPL_API_HOST.strip().rstrip("/")
+    if host.startswith("https://") or host.startswith("http://"):
+        host = urlsplit(host).netloc
+    if host not in ("api-free.deepl.com", "api.deepl.com"):
+        LOGGER.warning("DeepL: host no reconocido; usa solo api-free.deepl.com o api.deepl.com")
+        return ""
+    return host
 
 def translate_deepl(text: str, target: str, source_lang: Optional[str]) -> str:
     if not USE_DEEPL or not DEEPL_API_KEY:
@@ -284,19 +308,24 @@ def translate_deepl(text: str, target: str, source_lang: Optional[str]) -> str:
         src = "EN"
     elif (source_lang or "").lower().startswith("es"):
         src = "ES"
-    url = f"https://{DEEPL_API_HOST}/v2/translate"
-    data = {"auth_key": DEEPL_API_KEY, "text": text, "target_lang": tgt}
+    host = deepl_host()
+    if not host:
+        return ""
+    url = f"https://{host}/v2/translate"
+    data = {"text": text, "target_lang": tgt}
     if src:
         data["source_lang"] = src
     try:
         def _post():
-            return requests.post(url, data=data, timeout=30)
+            return requests.post(url, data=data, headers={"Authorization": f"DeepL-Auth-Key {DEEPL_API_KEY}"}, timeout=30)
         resp = _post()
         if resp.status_code != 200:
+            LOGGER.warning("DeepL respondió con HTTP %s (host=%s); cuerpo omitido", resp.status_code, host)
             return ""
         js = resp.json()
         return (js.get("translations", [{}])[0].get("text") or "").strip()
-    except Exception:
+    except Exception as exc:
+        LOGGER.warning("DeepL falló: %s", type(exc).__name__)
         return ""
 
 def translate_google(text: str, target: str, source_lang: Optional[str]) -> str:
@@ -304,7 +333,8 @@ def translate_google(text: str, target: str, source_lang: Optional[str]) -> str:
         from deep_translator import GoogleTranslator
         src = source_lang if source_lang in ("es","en") else "auto"
         return GoogleTranslator(source=src, target=target).translate(text) or ""
-    except Exception:
+    except Exception as exc:
+        LOGGER.warning("Traducción alternativa falló: %s", type(exc).__name__)
         return ""
 
 # Glosario local
@@ -454,6 +484,39 @@ async def health(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await update.message.reply_text("ok")
 
+
+async def diagnostico(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        await update.message.reply_text("Bot privado: acceso no autorizado.")
+        return
+    host = deepl_host()
+    if not USE_DEEPL:
+        deep_status = "desactivado por USE_DEEPL"
+    elif not DEEPL_API_KEY:
+        deep_status = "falta DEEPL_API_KEY"
+    elif not host:
+        deep_status = "DEEPL_API_HOST inválido"
+    else:
+        try:
+            response = await asyncio.to_thread(
+                requests.post, f"https://{host}/v2/translate",
+                headers={"Authorization": f"DeepL-Auth-Key {DEEPL_API_KEY}"},
+                data={"text": "Hola", "target_lang": "EN", "source_lang": "ES"},
+                timeout=20,
+            )
+            deep_status = f"HTTP {response.status_code}" + (" · operativo" if response.status_code == 200 else " · revisar plan, clave y host")
+        except Exception as exc:
+            deep_status = f"fallo de conexión ({type(exc).__name__})"
+    try:
+        from deep_translator import GoogleTranslator
+        google_status = "dependencia instalada"
+    except ImportError:
+        google_status = "falta deep-translator en el despliegue"
+    await update.message.reply_text(
+        f"DeepL: {deep_status}\nProveedor alternativo: {google_status}\n"
+        "Este diagnóstico no muestra ninguna clave."
+    )
+
 # Cada solicitud guarda su propio texto para que los botones no mezclen mensajes.
 def _remember(context, text, source="unknown"):
     key = uuid.uuid4().hex[:12]
@@ -507,15 +570,20 @@ async def handle_translation_choice(update: Update, context: ContextTypes.DEFAUL
         return
     await query.answer()
     src = "en" if dst == "es" else "es"
-    translated = await asyncio.to_thread(translate_smart, text_in, dst, src)
-    if not translated:
-        await query.message.reply_text("No pude traducir ahora. Comprueba la clave y el host de DeepL o la conexión del proveedor alternativo.")
+    speech_text, links = split_links(text_in)
+    translated = await asyncio.to_thread(translate_smart, speech_text, dst, src) if speech_text else ""
+    if not translated and speech_text:
+        await query.message.reply_text("No pude traducir. Revisa en Railway el código HTTP de DeepL (sin mostrar la clave), USE_DEEPL y DEEPL_API_HOST. El texto original sigue disponible.")
         return
     label = "Español" if dst == "es" else "Inglés"
     if kind == "t":
+        output = translated + ("\n\nEnlaces originales:\n" + "\n".join(links) if links else "")
         # Telegram limita los mensajes de texto a 4096 caracteres.
-        for start in range(0, len(translated), 3900):
-            await query.message.reply_text(f"Traducción ({label}):\n{translated[start:start + 3900]}")
+        for start in range(0, len(output), 3800):
+            await query.message.reply_text(f"Traducción ({label}):\n{output[start:start + 3800]}")
+        return
+    if not translated:
+        await query.message.reply_text("El mensaje solo contiene enlaces. Puedes reenviarlos tal cual; no hay texto para convertir en audio.\n" + "\n".join(links))
         return
     with tempfile.TemporaryDirectory() as tmp:
         out_mp3 = os.path.join(tmp, "traduccion.mp3")
@@ -526,8 +594,11 @@ async def handle_translation_choice(update: Update, context: ContextTypes.DEFAUL
         with open(out_mp3, "rb") as f:
             await query.message.reply_document(
                 document=InputFile(f, filename=f"Traducción_{dst.upper()}.mp3"),
-                caption=f"Traducción en {label}"
+                caption=f"Traducción en {label}" + ("\nEnlaces originales:\n" + "\n".join(links) if links and len("\n".join(links)) < 800 else "")
             )
+        if links and len("\n".join(links)) >= 800:
+            for start in range(0, len("\n".join(links)), 3900):
+                await query.message.reply_text("Enlaces originales:\n" + "\n".join(links)[start:start + 3900])
 
 
 async def _queue_audio(update, context, file_id, suffix):
@@ -645,6 +716,7 @@ def build_app():
     app = Application.builder().token(bot_token).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("health", health))
+    app.add_handler(CommandHandler("diagnostico", diagnostico))
     app.add_handler(CallbackQueryHandler(handle_translation_choice, pattern=r"^tr:"))
     app.add_handler(CallbackQueryHandler(handle_audio_language, pattern=r"^stt:"))
 
