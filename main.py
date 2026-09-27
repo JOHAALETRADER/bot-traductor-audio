@@ -290,6 +290,51 @@ def split_links(text):
     return URL_RE.sub(remove, text).strip(), links
 
 
+def clean_copied_translation(text):
+    """Quita los encabezados del bot viejo al pegar una respuesta completa."""
+    match = re.search(
+        r"(?im)^Original:\s*\n(?P<original>.*?)(?=^Traducci[oó]n\s*\([^\n]*\)\s*:|\Z)",
+        text, re.DOTALL | re.IGNORECASE | re.MULTILINE,
+    )
+    return match.group("original").strip() if match else text.strip()
+
+
+def prepare_message(text):
+    """Separa cuerpo y enlaces con su marca, sin traducir las URL."""
+    body_lines = []
+    links = []
+    platform = None
+    for line in clean_copied_translation(text).splitlines():
+        stripped = line.strip()
+        if re.fullmatch(r"(?:enlace[s]? de registro|registration links?)\s*:", stripped, re.I):
+            continue
+        if re.fullmatch(r"BINOMO\s*(?:👇)?", stripped, re.I):
+            platform = "BINOMO"
+            continue
+        if re.fullmatch(r"STOCKITY\s*(?:👇)?", stripped, re.I):
+            platform = "STOCKITY"
+            continue
+        matches = list(URL_RE.finditer(line))
+        if matches:
+            rest, found = split_links(line)
+            for link in found:
+                domain = urlsplit(link).netloc.lower()
+                name = "BINOMO" if "binomo" in domain else "STOCKITY" if "stockity" in domain else platform or "LINK"
+                links.append((name, link))
+            if rest.strip():
+                body_lines.append(rest)
+            continue
+        body_lines.append(line)
+    return "\n".join(body_lines).strip(), links
+
+
+def format_links(links, target):
+    if not links:
+        return ""
+    heading = "Registration links:" if target == "en" else "Enlaces de registro:"
+    return heading + "\n\n" + "\n\n".join(f"{name}\n{url}" for name, url in links)
+
+
 def deepl_host():
     host = DEEPL_API_HOST.strip().rstrip("/")
     if host.startswith("https://") or host.startswith("http://"):
@@ -537,8 +582,26 @@ def _buttons(key, source):
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(f"{label} · texto", callback_data=f"tr:{key}:{dst}:t"),
          InlineKeyboardButton(f"{label} · audio", callback_data=f"tr:{key}:{dst}:a")]
+        + [InlineKeyboardButton("Audio individual ZIP", callback_data=f"tr:{key}:{dst}:z")]
         for label, dst in directions
     ])
+
+
+async def _progress(message, label, operation, chat_id, bot):
+    """Mantiene visible la actividad mientras se ejecuta una tarea lenta."""
+    task = asyncio.create_task(operation)
+    try:
+        while True:
+            try:
+                return await asyncio.wait_for(asyncio.shield(task), timeout=5)
+            except asyncio.TimeoutError:
+                try:
+                    await bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+                except Exception:
+                    pass
+    finally:
+        if not task.done():
+            task.cancel()
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -548,7 +611,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text_in = (update.message.text or "").strip()
     if not text_in:
         return
-    src = detect_lang(text_in)
+    src = detect_lang(prepare_message(text_in)[0])
     key = _remember(context, text_in, src)
     await update.message.reply_text(
         "Elige cómo quieres la traducción:", reply_markup=_buttons(key, src)
@@ -562,43 +625,56 @@ async def handle_translation_choice(update: Update, context: ContextTypes.DEFAUL
         return
     try:
         _, key, dst, kind = query.data.split(":")
-        if dst not in ("es", "en") or kind not in ("t", "a"):
+        if dst not in ("es", "en") or kind not in ("t", "a", "z"):
             raise ValueError("Opción inválida")
         text_in, hint = context.user_data.get("translations", {})[key]
     except (ValueError, KeyError, AttributeError):
         await query.answer("Esta opción expiró. Envía el mensaje otra vez.", show_alert=True)
         return
     await query.answer()
+    progress = await query.message.reply_text("⏳ Traduciendo…")
     src = "en" if dst == "es" else "es"
-    speech_text, links = split_links(text_in)
-    translated = await asyncio.to_thread(translate_smart, speech_text, dst, src) if speech_text else ""
+    speech_text, links = prepare_message(text_in)
+    links_block = format_links(links, dst)
+    translated = await _progress(progress, "traducción", asyncio.to_thread(translate_smart, speech_text, dst, src), query.message.chat_id, context.bot) if speech_text else ""
     if not translated and speech_text:
-        await query.message.reply_text("No pude traducir. Revisa en Railway el código HTTP de DeepL (sin mostrar la clave), USE_DEEPL y DEEPL_API_HOST. El texto original sigue disponible.")
+        await progress.edit_text("No pude traducir. Revisa en Railway el código HTTP de DeepL (sin mostrar la clave), USE_DEEPL y DEEPL_API_HOST.")
         return
     label = "Español" if dst == "es" else "Inglés"
     if kind == "t":
-        output = translated + ("\n\nEnlaces originales:\n" + "\n".join(links) if links else "")
+        await progress.edit_text("✅ Traducción lista.")
+        output = translated + ("\n\n" + links_block if links_block else "")
         # Telegram limita los mensajes de texto a 4096 caracteres.
         for start in range(0, len(output), 3800):
             await query.message.reply_text(f"Traducción ({label}):\n{output[start:start + 3800]}")
         return
     if not translated:
-        await query.message.reply_text("El mensaje solo contiene enlaces. Puedes reenviarlos tal cual; no hay texto para convertir en audio.\n" + "\n".join(links))
+        await progress.edit_text("El mensaje solo contiene enlaces. Puedes reenviarlos tal cual; no hay texto para convertir en audio.\n\n" + links_block)
         return
+    await progress.edit_text("⏳ Traducción lista. Generando el audio…")
     with tempfile.TemporaryDirectory() as tmp:
         out_mp3 = os.path.join(tmp, "traduccion.mp3")
-        ok = await asyncio.to_thread(tts_to_mp3, translated, dst, out_mp3)
+        ok = await _progress(progress, "voz", asyncio.to_thread(tts_to_mp3, translated, dst, out_mp3), query.message.chat_id, context.bot)
         if not ok:
-            await query.message.reply_text("La traducción está lista, pero no pude generar el audio. Puedes usar el botón de texto.")
+            await progress.edit_text("La traducción está lista, pero no pude generar el audio. Puedes usar el botón de texto.")
             return
-        with open(out_mp3, "rb") as f:
+        output_path = out_mp3
+        output_name = f"Traducción_{dst.upper()}.mp3"
+        if kind == "z":
+            output_path = os.path.join(tmp, "traduccion_individual.zip")
+            with zipfile.ZipFile(output_path, "w", zipfile.ZIP_DEFLATED) as bundle:
+                bundle.write(out_mp3, arcname=output_name)
+            output_name = "Traducción_individual.zip"
+        with open(output_path, "rb") as f:
             await query.message.reply_document(
-                document=InputFile(f, filename=f"Traducción_{dst.upper()}.mp3"),
-                caption=f"Traducción en {label}" + ("\nEnlaces originales:\n" + "\n".join(links) if links and len("\n".join(links)) < 800 else "")
+                document=InputFile(f, filename=output_name),
+                caption=("English translation" if dst == "en" else "Traducción en español")
+                + ("\n\n" + links_block if links_block and len(links_block) < 850 else "")
             )
-        if links and len("\n".join(links)) >= 800:
-            for start in range(0, len("\n".join(links)), 3900):
-                await query.message.reply_text("Enlaces originales:\n" + "\n".join(links)[start:start + 3900])
+        await progress.edit_text("✅ Audio listo.")
+        if links_block and len(links_block) >= 850:
+            for start in range(0, len(links_block), 3900):
+                await query.message.reply_text(links_block[start:start + 3900])
 
 
 async def _queue_audio(update, context, file_id, suffix):
@@ -630,11 +706,16 @@ async def handle_audio_language(update, context):
         await query.answer("Esta opción expiró. Envía el audio otra vez.", show_alert=True)
         return
     await query.answer()
-    tg_file = await context.bot.get_file(file_id)
-    await _process_audio_file(query.message, context, tg_file, suffix, src)
+    progress = await query.message.reply_text("⏳ Recibí tu elección. Descargando y preparando el audio…")
+    try:
+        tg_file = await context.bot.get_file(file_id)
+        await _process_audio_file(query.message, context, tg_file, suffix, src, progress)
+    except Exception:
+        LOGGER.exception("Falló el procesamiento del audio (sin contenido del mensaje)")
+        await progress.edit_text("No pude procesar el audio. Envíalo de nuevo.")
 
 
-async def _process_audio_file(message, context: ContextTypes.DEFAULT_TYPE, tg_file, tmp_suffix: str, src: str):
+async def _process_audio_file(message, context: ContextTypes.DEFAULT_TYPE, tg_file, tmp_suffix: str, src: str, progress):
     await context.bot.send_chat_action(chat_id=message.chat_id, action=ChatAction.TYPING)
     with tempfile.TemporaryDirectory() as tmp:
         suffix = tmp_suffix if tmp_suffix.lower() in (".ogg", ".oga", ".opus", ".mp3", ".m4a", ".wav", ".aac", ".flac") else ".audio"
@@ -642,17 +723,20 @@ async def _process_audio_file(message, context: ContextTypes.DEFAULT_TYPE, tg_fi
         wav_path = os.path.join(tmp, "entrada.wav")
         try:
             await tg_file.download_to_drive(custom_path=input_path)
+            await progress.edit_text("⏳ Audio recibido. Convirtiendo el formato…")
             ok = await asyncio.to_thread(ffmpeg_to_wav_mono16k, input_path, wav_path)
             if not ok:
-                await message.reply_text("No pude convertir el audio. Revisa que FFmpeg esté instalado.")
+                await progress.edit_text("No pude convertir el audio. Revisa que FFmpeg esté instalado.")
                 return
-            best, hint, text_es, text_en = await asyncio.to_thread(vosk_transcribe_both, wav_path, src)
+            await progress.edit_text("⏳ Transcribiendo la voz. La primera vez puede tardar más si se descarga el modelo…")
+            best, hint, text_es, text_en = await _progress(progress, "transcripción", asyncio.to_thread(vosk_transcribe_both, wav_path, src), message.chat_id, context.bot)
         except Exception:
-            await message.reply_text("No pude descargar o procesar este audio. Inténtalo de nuevo.")
+            await progress.edit_text("No pude descargar o procesar este audio. Inténtalo de nuevo.")
             return
     if not best:
-        await message.reply_text("No pude transcribir este audio. Comprueba que los modelos Vosk estén disponibles y que se escuche la voz.")
+        await progress.edit_text("No pude transcribir este audio. Comprueba que los modelos Vosk estén disponibles y que se escuche la voz.")
         return
+    await progress.edit_text("✅ Transcripción lista.")
     key = _remember(context, best, src)
     for start in range(0, len(best), 3800):
         title = "Transcripción:" if start == 0 else "Transcripción (continuación):"
