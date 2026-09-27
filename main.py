@@ -7,6 +7,8 @@ import tempfile
 import urllib.request
 import shutil
 import re
+import wave
+import uuid
 from pathlib import Path
 from typing import Optional
 
@@ -14,9 +16,9 @@ from typing import Optional
 import asyncio
 import requests
 
-from telegram import Update, InputFile
+from telegram import Update, InputFile, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ChatAction
-from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
+from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
 
 # ========= Acceso por múltiples IDs (NUEVO) =========
 # Si no se define ALLOWED_USERS en env, por defecto permite 5958164558
@@ -153,8 +155,6 @@ EMOJI_WORDS = [
     "purple heart",
     "black heart",
     "white heart",
-    "fire",
-    "rocket",
     "hundred points",
     "trophy",
     "clapping hands",
@@ -162,7 +162,6 @@ EMOJI_WORDS = [
     "grinning face",
     "face with tears of joy",
     "sparkles",
-    "star",
     "check mark",
     "warning",
 ]
@@ -182,12 +181,14 @@ def remove_emoji_words(text: str) -> str:
 # ========= Reconocimiento Vosk =========
 FORCE_STT_LANG = getenv_stripped("FORCE_STT_LANG", "auto").lower()  # 'es' | 'en' | 'auto'
 
-def vosk_transcribe_both(wav_path: str):
+def vosk_transcribe_both(wav_path: str, spoken_lang: Optional[str] = None):
     """
     Retorna (text_best, src_hint, text_es, text_en)
     src_hint: 'es' | 'en' | 'unknown'
-    En AUTO: corre SIEMPRE ES y EN para evitar detección errónea.
+    Con spoken_lang usa únicamente el modelo del idioma elegido.
     """
+    if spoken_lang is not None and spoken_lang not in ("es", "en"):
+        raise ValueError("Idioma de audio inválido")
     try:
         import vosk
     except Exception:
@@ -198,35 +199,41 @@ def vosk_transcribe_both(wav_path: str):
 
     # --- ES ---
     try:
+        if spoken_lang == "en":
+            raise ValueError("Modelo español no solicitado")
         ensure_model(ES_MODEL_DIR, ES_URL)
         model_es = __import__("vosk").Model(str(ES_MODEL_DIR))
         rec_es = __import__("vosk").KaldiRecognizer(model_es, 16000)
-        with open(wav_path, "rb") as f:
+        chunks = []
+        with wave.open(wav_path, "rb") as f:
             while True:
-                data = f.read(4000)
+                data = f.readframes(4000)
                 if not data:
                     break
-                rec_es.AcceptWaveform(data)
-        res = json.loads(rec_es.FinalResult() or "{}")
-        text_es = strip_laughter_noises((res.get("text") or "").strip())
+                if rec_es.AcceptWaveform(data):
+                    chunks.append(json.loads(rec_es.Result() or "{}").get("text", ""))
+        chunks.append(json.loads(rec_es.FinalResult() or "{}").get("text", ""))
+        text_es = strip_laughter_noises(" ".join(chunks).strip())
     except Exception:
         text_es = ""
 
     # --- EN (siempre en AUTO, y también si se fuerza EN) ---
-    run_en = (FORCE_STT_LANG in ("auto", "en"))
+    run_en = (spoken_lang == "en") or (spoken_lang is None and FORCE_STT_LANG in ("auto", "en"))
     if run_en:
         try:
             ensure_model(EN_MODEL_DIR, EN_URL)
             model_en = __import__("vosk").Model(str(EN_MODEL_DIR))
             rec_en = __import__("vosk").KaldiRecognizer(model_en, 16000)
-            with open(wav_path, "rb") as f:
+            chunks = []
+            with wave.open(wav_path, "rb") as f:
                 while True:
-                    data = f.read(4000)
+                    data = f.readframes(4000)
                     if not data:
                         break
-                    rec_en.AcceptWaveform(data)
-            res = json.loads(rec_en.FinalResult() or "{}")
-            text_en = strip_laughter_noises((res.get("text") or "").strip())
+                    if rec_en.AcceptWaveform(data):
+                        chunks.append(json.loads(rec_en.Result() or "{}").get("text", ""))
+            chunks.append(json.loads(rec_en.FinalResult() or "{}").get("text", ""))
+            text_en = strip_laughter_noises(" ".join(chunks).strip())
         except Exception:
             text_en = ""
 
@@ -235,9 +242,9 @@ def vosk_transcribe_both(wav_path: str):
     text_en = remove_emoji_words(text_en)
 
     # Fuerza directa
-    if FORCE_STT_LANG == "es":
+    if spoken_lang == "es" or (spoken_lang is None and FORCE_STT_LANG == "es"):
         return (text_es, "es" if text_es else "unknown", text_es, text_en)
-    if FORCE_STT_LANG == "en":
+    if spoken_lang == "en" or (spoken_lang is None and FORCE_STT_LANG == "en"):
         return (text_en, "en" if text_en else "unknown", text_es, text_en)
 
     # AUTO: escoger mejor por score
@@ -265,10 +272,11 @@ def detect_lang(text: str) -> str:
 # ========= Traducción (DeepL -> Google) + Glosario =========
 DEEPL_API_KEY = getenv_stripped("DEEPL_API_KEY", "")
 DEEPL_API_HOST = getenv_stripped("DEEPL_API_HOST", "api-free.deepl.com")
-USE_LOCAL_GLOSSARY = getenv_stripped("USE_LOCAL_GLOSSARY", "true").lower() in ("1","true","yes")
+USE_DEEPL = getenv_stripped("USE_DEEPL", "true").lower() in ("1", "true", "yes")
+USE_LOCAL_GLOSSARY = getenv_stripped("USE_LOCAL_GLOSSARY", "false").lower() in ("1","true","yes")
 
 def translate_deepl(text: str, target: str, source_lang: Optional[str]) -> str:
-    if not DEEPL_API_KEY:
+    if not USE_DEEPL or not DEEPL_API_KEY:
         return ""
     tgt = "EN" if str(target).lower().startswith("en") else "ES"
     src = None
@@ -283,10 +291,7 @@ def translate_deepl(text: str, target: str, source_lang: Optional[str]) -> str:
     try:
         def _post():
             return requests.post(url, data=data, timeout=30)
-        try:
-            resp = asyncio.get_event_loop().run_until_complete(asyncio.to_thread(_post))
-        except Exception:
-            resp = requests.post(url, data=data, timeout=30)
+        resp = _post()
         if resp.status_code != 200:
             return ""
         js = resp.json()
@@ -305,14 +310,16 @@ def translate_google(text: str, target: str, source_lang: Optional[str]) -> str:
 # Glosario local
 ES_EN_RULES = [
     (r"\bdep[oó]sito[s]?\s+m[ií]nimo[s]?\b", "minimum deposit"),
-    (r"\bse[ñn]al(es)?\b", "signal"),
+    (r"\bse[ñn]ales\b", "signals"),
+    (r"\bse[ñn]al\b", "signal"),
     (r"\bapalancamiento\b", "leverage"),
     (r"\bcuenta[s]?\b", "account"),
     (r"\bretirad[ao]s?\b", "withdrawal"),
 ]
 EN_ES_RULES = [
     (r"\bminimum\s+deposit(s)?\b", "depósito mínimo"),
-    (r"\bsignal(s)?\b", "señal"),
+    (r"\bsignals\b", "señales"),
+    (r"\bsignal\b", "señal"),
     (r"\bleverage\b", "apalancamiento"),
     (r"\baccount(s)?\b", "cuenta"),
     (r"\bwithdrawal(s)?\b", "retiro"),
@@ -431,10 +438,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     msg = (
         "Traductor de audios y texto:\n"
-        "• Nota de voz ES → EN (texto + audio)\n"
-        "• Nota de voz EN → ES (texto + audio)\n"
-        "• Texto ES → audio EN\n"
-        "• Texto EN → audio ES\n"
+        "• Envía texto y elige traducción en texto o audio.\n"
+        "• Envía un audio, indica si se habla en español o inglés y revisa su transcripción.\n"
+        "• Luego elige la traducción en texto o audio.\n"
         "\nComandos:\n/health (estado)"
     )
     await update.message.reply_text(msg)
@@ -448,132 +454,142 @@ async def health(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await update.message.reply_text("ok")
 
-# ---- Texto a audio (ES<->EN) ----
+# Cada solicitud guarda su propio texto para que los botones no mezclen mensajes.
+def _remember(context, text, source="unknown"):
+    key = uuid.uuid4().hex[:12]
+    items = context.user_data.setdefault("translations", {})
+    items[key] = (text, source)
+    while len(items) > 20:
+        items.pop(next(iter(items)))
+    return key
+
+
+def _buttons(key, source):
+    if source == "es":
+        directions = [("🇬🇧 Inglés", "en")]
+    elif source == "en":
+        directions = [("🇪🇸 Español", "es")]
+    else:
+        directions = [("🇬🇧 Inglés", "en"), ("🇪🇸 Español", "es")]
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"{label} · texto", callback_data=f"tr:{key}:{dst}:t"),
+         InlineKeyboardButton(f"{label} · audio", callback_data=f"tr:{key}:{dst}:a")]
+        for label, dst in directions
+    ])
+
+
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update):
-        try:
-            await update.message.reply_text("Bot privado: acceso no autorizado.")
-        except Exception:
-            pass
+        await update.message.reply_text("Bot privado: acceso no autorizado.")
         return
-
     text_in = (update.message.text or "").strip()
     if not text_in:
         return
-    try:
-        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
-    except Exception:
-        pass
-
     src = detect_lang(text_in)
-    dst = "en" if src == "es" else ("es" if src == "en" else "es")
-    translated = translate_smart(text_in, target=dst, source_lang=src if src in ("es","en") else None)
+    key = _remember(context, text_in, src)
+    await update.message.reply_text(
+        "Elige cómo quieres la traducción:", reply_markup=_buttons(key, src)
+    )
 
-    human_src = "Español" if src == "es" else "Inglés" if src == "en" else "desconocido"
-    human_dst = "Inglés" if dst == "en" else "Español"
-    reply = [
-        f"Idioma detectado (texto): {human_src}",
-        "",
-        "Original:",
-        text_in,
-        "",
-        f"Traducción ({human_dst}):",
-        translated if translated else "(no disponible)"
-    ]
-    await update.message.reply_text("\n".join(reply))
 
-    if translated:
-        out_mp3 = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3").name
-        if tts_to_mp3(translated, dst, out_mp3):
-            try:
-                await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.UPLOAD_AUDIO)
-            except Exception:
-                pass
-            performer = (update.effective_user.first_name or "Johanna").strip()
-            title = f"Traducción ({'EN' if dst == 'en' else 'ES'})"
-            with open(out_mp3, "rb") as f:
-                await update.message.reply_document(
-                    document=InputFile(f, filename=f"{title}.mp3"),
-                    caption=f"{title} — {performer}"
-                )
-        else:
-            await update.message.reply_text("No pude generar el audio de la traducción (TTS).")
-
-# ---------- Pipeline común para VOICE/AUDIO/DOCUMENT ----------
-async def _process_audio_file(update: Update, context: ContextTypes.DEFAULT_TYPE, tg_file, tmp_suffix: str):
+async def handle_translation_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not is_allowed(update):
+        await query.answer("Acceso no autorizado", show_alert=True)
+        return
     try:
-        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
-    except Exception:
-        pass
-
-    # 1) Guardar entrada
-    tf_in = tempfile.NamedTemporaryFile(delete=False, suffix=tmp_suffix)
-    await tg_file.download_to_drive(custom_path=tf_in.name)
-
-    # 2) Convertir a WAV 16k mono
-    wav_path = tf_in.name + ".wav"
-    ok = ffmpeg_to_wav_mono16k(tf_in.name, wav_path)
-    if not ok:
-        await update.message.reply_text("No pude convertir el audio. Revisa FFmpeg (agrega apt.txt con 'ffmpeg').")
+        _, key, dst, kind = query.data.split(":")
+        if dst not in ("es", "en") or kind not in ("t", "a"):
+            raise ValueError("Opción inválida")
+        text_in, hint = context.user_data.get("translations", {})[key]
+    except (ValueError, KeyError, AttributeError):
+        await query.answer("Esta opción expiró. Envía el mensaje otra vez.", show_alert=True)
         return
-
-    # 3) Transcribir
-    text_best, src_hint, text_es, text_en = vosk_transcribe_both(wav_path)
-    if not text_best:
-        await update.message.reply_text("No pude transcribir el audio.")
+    await query.answer()
+    src = "en" if dst == "es" else "es"
+    translated = await asyncio.to_thread(translate_smart, text_in, dst, src)
+    if not translated:
+        await query.message.reply_text("No pude traducir ahora. Comprueba la clave y el host de DeepL o la conexión del proveedor alternativo.")
         return
+    label = "Español" if dst == "es" else "Inglés"
+    if kind == "t":
+        # Telegram limita los mensajes de texto a 4096 caracteres.
+        for start in range(0, len(translated), 3900):
+            await query.message.reply_text(f"Traducción ({label}):\n{translated[start:start + 3900]}")
+        return
+    with tempfile.TemporaryDirectory() as tmp:
+        out_mp3 = os.path.join(tmp, "traduccion.mp3")
+        ok = await asyncio.to_thread(tts_to_mp3, translated, dst, out_mp3)
+        if not ok:
+            await query.message.reply_text("La traducción está lista, pero no pude generar el audio. Puedes usar el botón de texto.")
+            return
+        with open(out_mp3, "rb") as f:
+            await query.message.reply_document(
+                document=InputFile(f, filename=f"Traducción_{dst.upper()}.mp3"),
+                caption=f"Traducción en {label}"
+            )
 
-    # Extra: limpia cualquier emoji-word que se haya colado
-    text_best = remove_emoji_words(text_best)
 
-    # 4) Decidir direcciones
-    src = normalize_lang(src_hint)
-    if src == "unknown":
-        sguess = guess_lang_by_stops(text_best)
-        src = sguess if sguess != "unknown" else detect_lang(text_best)
-    dst = "en" if src == "es" else ("es" if src == "en" else "es")
+async def _queue_audio(update, context, file_id, suffix):
+    key = uuid.uuid4().hex[:12]
+    pending = context.user_data.setdefault("pending_audio", {})
+    pending[key] = (file_id, suffix)
+    while len(pending) > 20:
+        pending.pop(next(iter(pending)))
+    await update.message.reply_text(
+        "¿En qué idioma se habla en este audio?",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("🇪🇸 Español", callback_data=f"stt:{key}:es"),
+            InlineKeyboardButton("🇬🇧 Inglés", callback_data=f"stt:{key}:en")
+        ]])
+    )
 
-    # 5) Traducir
-    translated = translate_smart(text_best, target=dst, source_lang=src if src in ("es","en") else None)
 
-    # fallback si detectó mal
-    if src == "en":
-        sim = jaccard_similarity(text_best, translated)
-        if is_spanishish(text_best) or sim >= 0.75:
-            src, dst = "es", "en"
-            translated = translate_smart(text_best, target=dst, source_lang="es")
+async def handle_audio_language(update, context):
+    query = update.callback_query
+    if not is_allowed(update):
+        await query.answer("Acceso no autorizado", show_alert=True)
+        return
+    try:
+        _, key, src = query.data.split(":")
+        if src not in ("es", "en"):
+            raise ValueError()
+        file_id, suffix = context.user_data["pending_audio"][key]
+    except (KeyError, ValueError):
+        await query.answer("Esta opción expiró. Envía el audio otra vez.", show_alert=True)
+        return
+    await query.answer()
+    tg_file = await context.bot.get_file(file_id)
+    await _process_audio_file(query.message, context, tg_file, suffix, src)
 
-    # 6) Respuesta textual
-    human_src = "Español" if src == "es" else "Inglés" if src == "en" else "desconocido"
-    human_dst = "Inglés" if dst == "en" else "Español"
-    reply = [
-        f"Idioma detectado: {human_src}",
-        "",
-        "Transcripción:",
-        text_best if text_best else "(vacío)",
-        "",
-        f"Traducción ({human_dst}):",
-        translated if translated else "(no disponible)"
-    ]
-    await update.message.reply_text("\n".join(reply))
 
-    # 7) Audio de la traducción (como documento, sin autoplay)
-    if translated:
-        out_mp3 = tf_in.name + ".mp3"
-        if tts_to_mp3(translated, dst, out_mp3):
-            try:
-                await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.UPLOAD_AUDIO)
-            except Exception:
-                pass
-            performer = (update.effective_user.first_name or "Johanna").strip()
-            title = f"Traducción ({'EN' if dst == 'en' else 'ES'})"
-            with open(out_mp3, "rb") as f:
-                await update.message.reply_document(
-                    document=InputFile(f, filename=f"{title}.mp3"),
-                    caption=f"{title} — {performer}"
-                )
-        else:
-            await update.message.reply_text("No pude generar el audio de la traducción (TTS).")
+async def _process_audio_file(message, context: ContextTypes.DEFAULT_TYPE, tg_file, tmp_suffix: str, src: str):
+    await context.bot.send_chat_action(chat_id=message.chat_id, action=ChatAction.TYPING)
+    with tempfile.TemporaryDirectory() as tmp:
+        suffix = tmp_suffix if tmp_suffix.lower() in (".ogg", ".oga", ".opus", ".mp3", ".m4a", ".wav", ".aac", ".flac") else ".audio"
+        input_path = os.path.join(tmp, "entrada" + suffix)
+        wav_path = os.path.join(tmp, "entrada.wav")
+        try:
+            await tg_file.download_to_drive(custom_path=input_path)
+            ok = await asyncio.to_thread(ffmpeg_to_wav_mono16k, input_path, wav_path)
+            if not ok:
+                await message.reply_text("No pude convertir el audio. Revisa que FFmpeg esté instalado.")
+                return
+            best, hint, text_es, text_en = await asyncio.to_thread(vosk_transcribe_both, wav_path, src)
+        except Exception:
+            await message.reply_text("No pude descargar o procesar este audio. Inténtalo de nuevo.")
+            return
+    if not best:
+        await message.reply_text("No pude transcribir este audio. Comprueba que los modelos Vosk estén disponibles y que se escuche la voz.")
+        return
+    key = _remember(context, best, src)
+    for start in range(0, len(best), 3800):
+        title = "Transcripción:" if start == 0 else "Transcripción (continuación):"
+        await message.reply_text(f"{title}\n{best[start:start + 3800]}")
+    await message.reply_text(
+        "Revisa la transcripción. Si no corresponde al audio, vuelve a enviarlo o elige el otro idioma. Elige el formato de traducción:",
+        reply_markup=_buttons(key, src)
+    )
 
 # ---- Nota de voz (VOICE) ----
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -586,8 +602,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     voice = update.message.voice
     if not voice:
         return
-    tg_file = await voice.get_file()
-    await _process_audio_file(update, context, tg_file, ".ogg")
+    await _queue_audio(update, context, voice.file_id, ".ogg")
 
 # ---- Audio normal (AUDIO) ----
 async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -600,9 +615,8 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     audio = update.message.audio
     if not audio:
         return
-    tg_file = await audio.get_file()
     suffix = os.path.splitext(audio.file_name or "audio.mp3")[1] or ".mp3"
-    await _process_audio_file(update, context, tg_file, suffix)
+    await _queue_audio(update, context, audio.file_id, suffix)
 
 # ---- Documento con audio (DOCUMENT) ----
 async def handle_document_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -621,9 +635,8 @@ async def handle_document_audio(update: Update, context: ContextTypes.DEFAULT_TY
     )
     if not is_audio_doc:
         return
-    tg_file = await doc.get_file()
     suffix = os.path.splitext(doc.file_name or "file.mp3")[1] or ".mp3"
-    await _process_audio_file(update, context, tg_file, suffix)
+    await _queue_audio(update, context, doc.file_id, suffix)
 
 def build_app():
     bot_token = getenv_stripped("BOT_TOKEN", "")
@@ -632,6 +645,8 @@ def build_app():
     app = Application.builder().token(bot_token).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("health", health))
+    app.add_handler(CallbackQueryHandler(handle_translation_choice, pattern=r"^tr:"))
+    app.add_handler(CallbackQueryHandler(handle_audio_language, pattern=r"^stt:"))
 
     # Texto (no comando)
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_text))
