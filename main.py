@@ -579,12 +579,11 @@ def _buttons(key, source):
         directions = [("🇪🇸 Español", "es")]
     else:
         directions = [("🇬🇧 Inglés", "en"), ("🇪🇸 Español", "es")]
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"{label} · texto", callback_data=f"tr:{key}:{dst}:t"),
-         InlineKeyboardButton(f"{label} · audio", callback_data=f"tr:{key}:{dst}:a")]
-        + [InlineKeyboardButton("Audio individual ZIP", callback_data=f"tr:{key}:{dst}:z")]
-        for label, dst in directions
-    ])
+    rows = []
+    for label, dst in directions:
+        rows.append([InlineKeyboardButton(f"{label} · texto", callback_data=f"tr:{key}:{dst}:t")])
+        rows.append([InlineKeyboardButton(f"{label} · audio", callback_data=f"tr:{key}:{dst}:a")])
+    return InlineKeyboardMarkup(rows)
 
 
 async def _progress(message, label, operation, chat_id, bot):
@@ -625,7 +624,7 @@ async def handle_translation_choice(update: Update, context: ContextTypes.DEFAUL
         return
     try:
         _, key, dst, kind = query.data.split(":")
-        if dst not in ("es", "en") or kind not in ("t", "a", "z"):
+        if dst not in ("es", "en") or kind not in ("t", "a"):
             raise ValueError("Opción inválida")
         text_in, hint = context.user_data.get("translations", {})[key]
     except (ValueError, KeyError, AttributeError):
@@ -658,19 +657,17 @@ async def handle_translation_choice(update: Update, context: ContextTypes.DEFAUL
         if not ok:
             await progress.edit_text("La traducción está lista, pero no pude generar el audio. Puedes usar el botón de texto.")
             return
-        output_path = out_mp3
         output_name = f"Traducción_{dst.upper()}.mp3"
-        if kind == "z":
-            output_path = os.path.join(tmp, "traduccion_individual.zip")
-            with zipfile.ZipFile(output_path, "w", zipfile.ZIP_DEFLATED) as bundle:
-                bundle.write(out_mp3, arcname=output_name)
-            output_name = "Traducción_individual.zip"
-        with open(output_path, "rb") as f:
-            await query.message.reply_document(
+        with open(out_mp3, "rb") as f:
+            sent = await query.message.reply_document(
                 document=InputFile(f, filename=output_name),
-                caption=("English translation" if dst == "en" else "Traducción en español")
-                + ("\n\n" + links_block if links_block and len(links_block) < 850 else "")
+                caption=links_block if links_block and len(links_block) < 950 else None
             )
+        if sent.document and sent.document.file_unique_id:
+            own_audio = context.user_data.setdefault("own_audio", {})
+            own_audio[sent.document.file_unique_id] = (translated + ("\n\n" + links_block if links_block else ""), dst)
+            while len(own_audio) > 30:
+                own_audio.pop(next(iter(own_audio)))
         await progress.edit_text("✅ Audio listo.")
         if links_block and len(links_block) >= 850:
             for start in range(0, len(links_block), 3900):
@@ -789,6 +786,15 @@ async def handle_document_audio(update: Update, context: ContextTypes.DEFAULT_TY
         name.endswith(ext) for ext in (".mp3", ".m4a", ".wav", ".ogg", ".oga", ".opus")
     )
     if not is_audio_doc:
+        return
+    known = context.user_data.get("own_audio", {}).get(doc.file_unique_id)
+    if known:
+        source_text, src = known
+        key = _remember(context, source_text, src)
+        await update.message.reply_text(
+            "Reconocí este audio generado aquí y recuperé su texto original para evitar errores de transcripción. Elige el formato de traducción:",
+            reply_markup=_buttons(key, src),
+        )
         return
     suffix = os.path.splitext(doc.file_name or "file.mp3")[1] or ".mp3"
     await _queue_audio(update, context, doc.file_id, suffix)
